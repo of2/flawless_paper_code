@@ -1,0 +1,1165 @@
+---
+title: "flawless_code_public_part2"
+author: "Owen Forbes"
+date: "06/10/2023"
+output: html_document
+---
+
+# Part 2 - Code accompanying paper "Functional analysis within latent states: A novel framework for analysing functional time series data"
+
+
+
+#---
+
+
+Relating FHMM dominants states, (and eventually FPCs within states of interest), to key health outcomes and demographics
+
+(Demographics)
+- Sex
+- Age
+- Handedness
+
+(Health outcomes)
+- depressive symptoms (MFQ parent report) 
+# Could make sense to check correlation between parent-report and self-report if going with parent-report for everybody...  wait and see how age relationship to states looks
+- anxiety symptoms (SCARED parent report)
+- positive affect (PANAS - self report)
+- negative affect (PANAS - self report)
+
+- cognitive function (NIH scores)
+
+- global functioning? (CGAS clinician rated)
+
+-----------------
+
+
+----------------
+STEPS
+
+
+1. import health & demographic data
+2. import FHMM results
+3. Calculate Viterbi dominant states, matched against study IDs 
+4. Create DF with dominant state, and outcome measures
+5. generate box plots and histograms for each outcome
+
+
+
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+```
+
+
+
+#----------
+
+
+
+
+
+
+
+
+```{r}
+
+# subset demog_health_df by ages 9-15
+
+load("index_1158_ages_915")
+
+load("demog_health_df_280223") #280223 - added YSR and WISC-V
+
+
+demog_health_df_915 <- demog_health_df[index_1158_ages_915,]
+
+psych::describe(demog_health_df_915)
+```
+
+
+
+# EXPLORING RESULTS BY FHMM AGES 9-15
+
+
+
+2. import FHMM results
+
+
+
+# EXPLORATORY ANALYSIS FOR ALL AGES MODEL (5-21)
+```{r}
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fit_fhmm_4state_ages915_initialised")
+
+estimated_fhmm_states_4_915 <- hmmhdd::viterbi(fit_fhmm_4state_ages915_initialised)
+
+#--------------
+
+
+fpc_s1_gg <- ggplot()+
+  geom_hline(yintercept = 0,colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,5],colour="FPC 5"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,4],colour="FPC 4"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,3],colour="FPC 3"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,2],colour="FPC 2"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,1],colour="FPC 1"))+
+  ylim(-0.6,0.6)+xlab("Frequency (Hz)")+theme_bw(base_size=14)+ylab("") +  scale_colour_viridis(name="Functional PCs", option = "turbo", discrete=T, direction = -1, begin = 0.15, end = 0.85)
+
+
+gg_fhmm_selected_4_initial_915<- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][1,],colour="State 1"))+ #1 most occupied - high delta, very low alpha, high upper beta
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][2,],colour="State 3"))+ # 3 most occupied - high freq moderate alpha, high lower beta
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][3,],colour="State 2"))+ #2 most occupied - high theta, low freq moderate alpha, low beta
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][4,],colour="State 4"))+ #4 least occupied - very high alpha
+  ylim(0,1.1) + ggtitle ("Centroids for 4 latent states from functional Hidden Markov model") + ylab("Power (uV^2/Hz)") +xlab("Frequency (Hz)")+theme_bw(base_size=14) + #scale_colour_manual(breaks=c(1,3,2,4),labels=c(1,2,3,4))
+ scale_colour_viridis(name="", option = "turbo", discrete=T, direction = -1, begin = 0.15, end = 0.85)#scale_colour_manual(name  ="Latent States",
+                            #breaks=c(1,3,2,4),
+                            #labels=c("State 1", "State 2", "State 3", "State 4"))
+#hist(estimated_fhmm_states_4_915)
+
+estimated_fhmm_states_4_915
+#gg_fhmm_selected_4_initial
+gg_fhmm_selected_4_initial_915
+
+# transition matrix
+fit_fhmm_4state_ages915_initialised$A
+
+
+#!!!!!!!!!!!!
+# NEED TO REJIG PLOTTING DATA FRAME to get legend for state labels... Put centroids into new data frame
+
+# SWITCH LABELS FOR STATES 2 and 3
+
+#!!!!!!!!!!!
+tiff("FHMM_centroids_230423.tif", compression = "lzw",width = 900, height = 600, pointsize = 12)
+gg_fhmm_selected_4_initial_915
+dev.off()  
+
+
+```
+
+
+2. Calculate Viterbi dominant states... Add to demog_health_df
+
+
+```{r}
+
+viterbi_matrix_915 <- t(matrix(estimated_fhmm_states_4_915,ncol = 503)) #stacks vertically - so start with 503 columns, and transpose
+
+dim(viterbi_matrix_915)
+#[1] 503  180 ---- 180 obs per person -- 5*40 seconds of eyes closed PSDs one per second, losing 4 seconds from each (head and tail 2 seconds)
+
+
+viterbi_df_for_psychdescribe_915 <- data.frame(t(viterbi_matrix_915))
+
+psych::describe(viterbi_df_for_psychdescribe_915)
+
+
+
+
+viterbi_df_915 <- data.frame(viterbi_matrix_915)
+
+viterbi_df_915$EID <- demog_health_df_915$EID
+
+
+```
+
+
+```{r}
+
+
+
+#!!!!!!!!!!!
+
+# SWITCH LABELS FOR STATES 2 and 3 HERE
+
+viterbi_df_915[viterbi_df_915 == 2] <- "temp"
+viterbi_df_915[viterbi_df_915 == 3] <- 2
+viterbi_df_915[viterbi_df_915 == "temp"] <- 3
+
+
+#!!!!!!!!!!!
+
+
+estimated_fhmm_states_4_915
+
+estimated_fhmm_states_4_915[estimated_fhmm_states_4_915 == 2] <- "temp"
+estimated_fhmm_states_4_915[estimated_fhmm_states_4_915 == 3] <- 2
+estimated_fhmm_states_4_915[estimated_fhmm_states_4_915 == "temp"] <- 3
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+
+```
+
+```{r}
+
+viterbi_df_915$dominant_state <- apply(viterbi_df_915,1,function(x) names(which.max(table(x))))
+viterbi_df_915$dominant_proportion <- rep(NA, length(viterbi_df_915$X1))
+
+for(i in 1:503){
+  viterbi_df_915$dominant_proportion[i] <- sum(viterbi_df_915[i,1:180]==viterbi_df_915$dominant_state[i],na.rm = T)/180
+}
+
+
+
+psych::describe(viterbi_df_915$dominant_proportion) #lowest = 0.34! rapidly switching 
+
+hist(viterbi_df_915$dominant_proportion,breaks=25) #modes at 0.6, 0.8 because **tendency to spend all of one EC segment in one state** according to FHMM
+
+
+# Needed to fix this below - was adding + onto n_states_visited for states 2-4
+viterbi_df_915$visits_1 <- apply(viterbi_df_915[,1:180],MARGIN = 1,function(x) ifelse(1 %in% x,1,0))
+viterbi_df_915$visits_2 <- apply(viterbi_df_915[,1:180],MARGIN = 1,function(x) ifelse(2 %in% x,1,0))
+viterbi_df_915$visits_3 <- apply(viterbi_df_915[,1:180],MARGIN = 1,function(x) ifelse(3 %in% x,1,0))
+viterbi_df_915$visits_4 <- apply(viterbi_df_915[,1:180],MARGIN = 1,function(x) ifelse(4 %in% x,1,0))
+  
+  
+  
+  
+  
+
+hist(as.numeric(viterbi_df_915$dominant_state),breaks=5)
+# viterbi_df[which.min(viterbi_df$dominant_proportion),] --> rapid switching between 4, 3, and 1
+
+
+
+# ALSO CALCULATE...
+
+# N of states
+# N of transitions
+# percent of time in each state
+
+
+viterbi_df_915$n_states_visited <- (viterbi_df_915$visits_1 + viterbi_df_915$visits_2 + viterbi_df_915$visits_3 + viterbi_df_915$visits_4)
+
+viterbi_df_915$n_transitions_within_EC <- (apply(viterbi_df_915[,1:36],1,function(x) sum(ifelse(x != lag(x) | is.na(lag(x)), 1, 0))-1) +
+                                    apply(viterbi_df_915[,1*36+(1:36)],1,function(x) sum(ifelse(x != lag(x) | is.na(lag(x)), 1, 0))-1) +
+                                    apply(viterbi_df_915[,2*36+(1:36)],1,function(x) sum(ifelse(x != lag(x) | is.na(lag(x)), 1, 0))-1) +
+                                    apply(viterbi_df_915[,3*36+(1:36)],1,function(x) sum(ifelse(x != lag(x) | is.na(lag(x)), 1, 0))-1) +
+                                    apply(viterbi_df_915[,4*36+(1:36)],1,function(x) sum(ifelse(x != lag(x) | is.na(lag(x)), 1, 0))-1)) # count transitions, minus 1 as it counts the first entry as 1, within 5 36 second windows
+# 
+
+viterbi_df_915$n_transitions_all <- (apply(viterbi_df_915[,1:180],1,function(x) sum(ifelse(x != lag(x) | is.na(lag(x)), 1, 0))-1)) #include transitions within and between EC segments
+
+viterbi_df_915$s1_percent <- apply(viterbi_df_915,MARGIN = 1,function(x) sum(x[1:180] == 1)/180)
+viterbi_df_915$s2_percent <- apply(viterbi_df_915,MARGIN = 1,function(x) sum(x[1:180] == 2)/180)
+viterbi_df_915$s3_percent <- apply(viterbi_df_915,MARGIN = 1,function(x) sum(x[1:180] == 3)/180)
+viterbi_df_915$s4_percent <- apply(viterbi_df_915,MARGIN = 1,function(x) sum(x[1:180] == 4)/180)
+
+
+
+view(viterbi_df_915)
+
+
+hist(viterbi_df_915$n_states_visited)
+
+hist(viterbi_df_915$s1_percent) #s1 is main state where people are there 100% - others are mostly mixed
+hist(viterbi_df_915$s2_percent)
+hist(viterbi_df_915$s3_percent)
+hist(viterbi_df_915$s4_percent)
+
+
+
+
+hist1 <- hist(as.numeric(viterbi_df_915$dominant_state),main="Number of individuals for whom each state is dominant", xlab = "Functional Latent States", ylab = "Number of individuals")
+
+
+hist2 <- hist(viterbi_df_915$n_states_visited, main = "Histogram of number of states visited")
+
+
+hist3 <- hist(viterbi_df_915$n_transitions_all, main = "Histogram of number of transitions between states")
+
+
+
+png("histograms_170323.png", width = 700, height = 1500, pointsize = 18)
+par(mfrow= c(3, 1))
+hist(as.numeric(viterbi_df_915$dominant_state),main="Number of individuals for whom each state is dominant", xlab = "Functional Latent States", ylab = "Number of individuals")
+hist(viterbi_df_915$n_states_visited, main = "Histogram of number of states visited")
+hist(viterbi_df_915$n_transitions_all, main = "Histogram of number of transitions between states")
+dev.off()  
+
+
+#-------
+
+# Trying using GGPLOT
+
+hist1 <- ggplot(viterbi_df_915, aes(x = as.numeric(dominant_state))) +
+  geom_histogram(binwidth = 1,col="black", fill = "lightgrey") +
+  labs(title = "Number of individuals for whom each FHMM latent state is dominant",
+       x = "Dominant State",
+       y = "Number of individuals")+theme_bw()
+
+hist2 <- ggplot(viterbi_df_915, aes(x = n_states_visited)) +
+  geom_histogram(binwidth = 1,col="black", fill = "lightgrey") +
+  labs(title = "Number of FHMM latent states visited",
+       x = "Number of States Visited",
+       y = "Count")+theme_bw()
+
+hist3 <- ggplot(viterbi_df_915, aes(x = n_transitions_all)) +
+  geom_histogram(binwidth = 1,col="black", fill = "lightgrey") +
+  labs(title = "Number of transitions between FHMM latent states",
+       x = "Number of Transitions",
+       y = "Count")+
+scale_x_continuous(breaks = seq(0, 8, 1), lim = c(-0.5, 8.5))+theme_bw()
+
+
+ggsave("histograms_230423.png", 
+       grid.arrange(hist1, hist2, hist3, ncol = 1, nrow = 3),
+       width = 7, height = 15, dpi = 300, units = "in")
+
+
+#-------
+
+sum(viterbi_df_915$n_states_visited==1)
+
+234/503
+
+sum(viterbi_df_915$n_states_visited==2)
+
+205/503
+
+
+sum(viterbi_df_915$n_transitions_all < 5)
+
+479/503
+
+```
+
+
+
+
+
+
+```{r}
+
+subset_viterbi_bits_915 <- viterbi_df_915[,181:ncol(viterbi_df_915)]
+
+demog_health_states_df_915 <- left_join(demog_health_df_915,subset_viterbi_bits_915,by="EID")
+
+ncol(demog_health_states_df_915) #23
+
+demog_health_states_df_915 <- demog_health_states_df_915 %>% mutate_at(c(2:ncol(demog_health_states_df_915)),as.numeric)
+
+
+# raw scores
+demog_health_states_df_915 %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean, sd=sd, range=range), na.rm=TRUE))
+
+# Z-scores
+demog_health_states_df_915 %>% mutate_at(c(5:25),scale) %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean), na.rm=TRUE))
+
+gg_fhmm_selected_4_initial_915
+
+
+
+
+
+#------  
+
+# test for dominant state group differences with ANOVA (or other?) for age, sex, handedness
+# no sig between group diffs
+
+aov_df_filter <- demog_health_states_df_915 %>% filter(dominant_proportion > 0.8)
+
+age_anova <- aov(Age ~ dominant_state, data = aov_df_filter)
+summary(age_anova)
+
+sex_anova <- aov(Sex ~ dominant_state, data = aov_df_filter)
+summary(sex_anova)
+
+hand_anova <- aov(EHQ_Total ~ dominant_state, data = aov_df_filter)
+summary(hand_anova)
+
+
+
+#------- Trimming down outcome measures
+
+demog_health_states_df_915_fewer_outcomes <- demog_health_states_df_915[,-c(6:10,16,17,20:25)]#-c(6:10,12:15,20:24)]
+
+view(demog_health_states_df_915_fewer_outcomes)
+
+#--------
+
+# raw scores compare by dominant state
+compare_raw_scores <- demog_health_states_df_915_fewer_outcomes %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean), na.rm=TRUE))
+
+# z-scores compare by dominant state
+
+compare_z_scores <- demog_health_states_df_915_fewer_outcomes %>% mutate_at(c(5:12),scale) %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean), na.rm=TRUE))
+
+
+view(compare_raw_scores)
+view(compare_z_scores)
+
+
+descriptive_stats_all <-  demog_health_states_df_915_fewer_outcomes %>% summarise(across(everything(), list(mean=mean, sd = sd), na.rm=TRUE))
+view(descriptive_stats_all)
+
+
+#-------- Compare only ppl who spend >80% in dominant state
+compare_raw_scores_dominant80 <- demog_health_states_df_915_fewer_outcomes %>% filter(dominant_proportion >= 0.8) %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean, sd = sd), na.rm=TRUE))
+view(compare_raw_scores_dominant80)
+
+compare_z_scores_dominant80 <- demog_health_states_df_915_fewer_outcomes %>% filter(dominant_proportion >= 0.8) %>% mutate_at(c(5:12),scale) %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean), na.rm=TRUE))
+view(compare_z_scores_dominant80)
+
+
+count_greater_80 <- demog_health_states_df_915_fewer_outcomes %>% filter(dominant_proportion > 0.8)
+#length(count_greater_80$dominant_state) #281 individuals > 0.8; 353 >= 0.8
+
+```
+
+
+#---------
+
+
+# gtsummary tables
+
+```{r}
+# Trying with gtsummary
+library(gtsummary)
+library(gt)
+
+gt_data <- demog_health_states_df_915_fewer_outcomes %>% relocate(c(5:6), .after = 10) %>%  rename(Cog_NIH7_Card = NIH7_Card,Cog_NIH7_Flanker = NIH7_Flanker,Cog_NIH7_List = NIH7_List,Cog_NIH7_Pattern = NIH7_Pattern)
+
+
+
+# overall
+
+overall_gt <- gt_data  %>% select(c(2:12)) %>%
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 1,
+      missing="no"
+    ) %>% 
+ add_n() %>% 
+    modify_header(label = "**Dominant State (>= 80%)**")
+  #gtsummary::as_gt() %>%
+  #gt::as_latex()
+
+
+# 80% dominant
+
+
+dominant_state_gt <- gt_data  %>% filter(dominant_proportion >= 0.8) %>% select(c(2:13)) %>%
+    tbl_summary(
+    by = dominant_state,
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 1,
+      missing="no"
+    ) %>% 
+     modify_header(label = "**Dominant State (>= 80%)**")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+# Combine them
+combined_gt <- tbl_merge(list(overall_gt,dominant_state_gt),tab_spanner = F) %>% 
+  modify_table_body(
+    mutate,
+    groupname_col = case_when(variable %in% c("Sex","Age","EHQ_Total") ~ "Demographics",
+                              variable %in% c("Cog_NIH7_Card","Cog_NIH7_Flanker","Cog_NIH7_List","Cog_NIH7_Pattern") ~ "Cognitive Function",
+                              variable %in% c("YSR_Ext_T","YSR_Int_T","MFQ_SR_Total..1","SCARED_SR_Total") ~ "Psychopathology")
+  )
+
+
+combined_gt %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html()
+
+
+  
+  
+  
+  
+```
+
+
+```{r}
+#---------
+
+# How many at each level?
+
+#sum(demog_health_states_df_915_fewer_outcomes$dominant_proportion > 0.8) #281
+#sum(demog_health_states_df_915_fewer_outcomes$dominant_proportion >= 0.8) #353
+#sum(demog_health_states_df_915_fewer_outcomes$dominant_proportion > 0.6) #407
+#sum(demog_health_states_df_915_fewer_outcomes$dominant_proportion >= 0.6) #458
+
+sum(demog_health_states_df_915_fewer_outcomes$dominant_proportion >= 0.8) #353
+length(demog_health_states_df_915_fewer_outcomes$EID) #503
+
+sum(demog_health_states_df_915_fewer_outcomes$dominant_proportion <= 0.6) #96
+sum(demog_health_states_df_915_fewer_outcomes$dominant_proportion <= 0.5) #17
+
+
+
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent > 0.8) #36
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent >= 0.8) #52
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent > 0.6) #60
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent >= 0.6) #71
+
+
+#------
+
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent > 0.8) #36
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent >= 0.8) #52
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent > 0.6) #60
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent >= 0.6) #71
+
+
+
+#-------
+
+sum(demog_health_states_df_915_fewer_outcomes$dominant_state==1) #213
+sum(demog_health_states_df_915_fewer_outcomes$dominant_state==2) #79
+sum(demog_health_states_df_915_fewer_outcomes$dominant_state==3) #139
+sum(demog_health_states_df_915_fewer_outcomes$dominant_state==4) #72
+
+
+#------
+
+
+sum(demog_health_states_df_915_fewer_outcomes$s1_percent>=0.8) #167
+sum(demog_health_states_df_915_fewer_outcomes$s2_percent>=0.8) #90
+sum(demog_health_states_df_915_fewer_outcomes$s3_percent>=0.8) #52
+sum(demog_health_states_df_915_fewer_outcomes$s4_percent>=0.8) #44
+
+
+```
+
+
+
+#---------------
+
+Fingerprint plots
+
+
+```{r}
+
+# Rename NIH vars to start with "Cog" for alphabetic order of plots
+
+demog_health_states_df_915_fewer_outcomes_fingerprints <- demog_health_states_df_915_fewer_outcomes %>% rename(Cog_NIH7_Card = NIH7_Card,Cog_NIH7_Flanker = NIH7_Flanker,Cog_NIH7_List = NIH7_List,Cog_NIH7_Pattern = NIH7_Pattern)
+
+# NB z-scores relative to WHOLE GROUP, not subset -- scale before filter
+compare_z_scores_dominant80 <- demog_health_states_df_915_fewer_outcomes_fingerprints %>% mutate_at(c(5:12),scale) %>% filter(dominant_proportion >= 0.8)  %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean), na.rm=TRUE))
+
+
+compare_z_scores_plots_df <- compare_z_scores_dominant80 %>% pivot_longer(cols = c(6:13),names_to = "health_measures",values_to = "z_scores")
+
+compare_z_scores_plots_80 <- ggplot(compare_z_scores_plots_df, aes(x=health_measures, y=z_scores, group=health_measures)) + 
+  geom_col(aes(fill=health_measures))+
+  scale_fill_manual(values=viridis::turbo(9,direction = -1), labels=c("NIH Card", "NIH Flanker", "NIH List", "NIH Pattern", "MFQ SR", "SCARED SR", "YSR Ext", "YSR Int"))+
+  #scale_fill_manual(values=viridis::turbo(9,direction = -1))+#turbo(9,direction = -1)[2:9])
+  #scale_fill_brewer(palette="Dark2") +
+  guides(fill=guide_legend(title="Health Measures"))+
+  facet_grid(. ~ dominant_state)+
+  theme_bw()+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + 
+  theme(panel.spacing = unit(2, "lines"))+
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+  xlab("FHMM Dominant State (>= 80%)")+
+  ylab("Z-Scores") + theme(text = element_text(size = 18))#+ylim(c(-0.25,0.25))
+  
+compare_z_scores_plots_80
+
+
+
+compare_z_scores_all <- demog_health_states_df_915_fewer_outcomes_fingerprints %>% mutate_at(c(5:12),scale) %>% group_by(dominant_state) %>% summarise(across(everything(), list(mean=mean), na.rm=TRUE))
+
+
+compare_z_scores_plots_all_df <- compare_z_scores_all %>% pivot_longer(cols = c(6:13),names_to = "health_measures",values_to = "z_scores")
+
+compare_z_scores_plots_all <- ggplot(compare_z_scores_plots_all_df, aes(x=health_measures, y=z_scores, group=health_measures)) + 
+  geom_col(aes(fill=health_measures))+
+  #scale_fill_manual(values=viridis::turbo(9,direction = -1)[2:9])+
+  scale_fill_manual(values=viridis::turbo(9,direction = -1), labels=c("NIH Card", "NIH Flanker", "NIH List", "NIH Pattern", "MFQ SR", "SCARED SR", "YSR Ext", "YSR Int"))+#turbo(9,direction = -1)[2:9])
+  #scale_fill_brewer(palette="Dark2") +
+  guides(fill=guide_legend(title="Health Measures"))+
+  facet_grid(. ~ dominant_state)+
+  theme_bw()+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + 
+  theme(panel.spacing = unit(2, "lines"))+
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+  xlab("FHMM Dominant State (ALL participants)")+
+  ylab("Z-Scores") + theme(text = element_text(size = 18)) #+ylim(c(-0.25,0.25))
+  
+compare_z_scores_plots_all
+
+# 
+# 
+# png("fingerprint_plots.png",width=1000,height=1000,pointsize=14)
+#   grid.arrange(eeg_fingerprint_plots,health_fingerprint_plots)
+# dev.off()
+
+
+
+
+
+
+
+#compare_z_scores_plots_all
+compare_z_scores_plots_80
+
+
+
+# Save as TIFF
+
+tiff("FHMM_fingerprints_100323.tif", compression = "lzw",width = 800, height = 600, pointsize = 12)
+compare_z_scores_plots_80
+dev.off()  
+
+```
+
+
+
+
+# VENN DIAGRAM for state visiting
+
+```{r}
+
+library(ggvenn)
+
+
+venn_df <- demog_health_states_df_915_fewer_outcomes %>% mutate(`State 1` = visits_1==1,`State 2` = visits_2==1,`State 3` = visits_3==1,`State 4` = visits_4==1)
+
+venn_plot <- ggvenn(venn_df,c("State 1","State 2","State 3","State 4"),
+  #fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+  #fill_color = viridis::turbo(9, direction = -1)[c(1,4,6,9)],
+  stroke_size = 0.5, set_name_size = 10, text_size=5.5
+  )
+
+
+
+tiff("FHMM_Venn_100323.tif", compression = "lzw",width = 800, height = 600, pointsize = 12)
+venn_plot
+dev.off()  
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#----------------
+
+
+
+# More detailed exploration within states
+
+* Run FPCA within each state
+--> AVERAGE each individual's loadings across all 1-second PSDs they spend in that state?
+
+
+
+- calculate further Viterbi features
+-- n. states visited
+-- n. transitions
+-- average visit length?
+// Other?
+
+
+
+
+# FPCA within states...
+
+```{r}
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_ages915_stacked")
+
+
+library(fda)
+library(viridis)
+
+FHMM_915_index_s1 <- which(estimated_fhmm_states_4_915 %in% 1) # red - low alpha
+FHMM_915_index_s2 <- which(estimated_fhmm_states_4_915 %in% 2) # green - high freq mod power alpha
+FHMM_915_index_s3 <- which(estimated_fhmm_states_4_915 %in% 3) # orange - low freq mod power alpha
+FHMM_915_index_s4 <- which(estimated_fhmm_states_4_915 %in% 4) # blue - v high alpha
+
+
+
+#------- FPCA by state
+
+#----------- state 1
+fooof_s1 <- t(as.matrix(fooof_ages915_stacked)[FHMM_915_index_s1,1:58]) 
+fpca_data_s1 <- fda::Data2fd(y=fooof_s1, argvals = c(seq(1.5,30,by=0.5)))
+fpca_s1 <- fda::pca.fd(fpca_data_s1, nharm = 8, harmfdPar=fdPar(fpca_data_s1),centerfns=TRUE)
+
+fpca_s1
+plot(fpca_s1$harmonics, lwd = 1)
+#summary(fpca_s1)
+fpca_s1$varprop
+plot(fpca_s1$varprop)
+
+cumsum(fpca_s1$varprop)
+
+
+
+fpc_s1_gg <- ggplot()+
+  geom_hline(yintercept = 0,colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,5],colour="FPC 5"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,4],colour="FPC 4"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,3],colour="FPC 3"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,2],colour="FPC 2"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s1$harmonics$coefs[1:58,1],colour="FPC 1"))+
+  ylim(-0.6,0.6)+xlab("Frequency (Hz)")+theme_bw(base_size=14)+ylab("") +  scale_colour_viridis(name="Functional PCs", option = "turbo", discrete=T, direction = -1, begin = 0.15, end = 0.85)
+
+
+
+#----------- state 2
+fooof_s2 <- t(as.matrix(fooof_ages915_stacked)[FHMM_915_index_s2,1:58]) 
+fpca_data_s2 <- fda::Data2fd(y=fooof_s2, argvals = c(seq(1.5,30,by=0.5)))
+fpca_s2 <- fda::pca.fd(fpca_data_s2, nharm = 8, harmfdPar=fdPar(fpca_data_s2),centerfns=TRUE)
+
+fpca_s2
+plot(fpca_s2$harmonics, lwd = 1)
+#summary(fpca_s2)
+fpca_s2$varprop
+plot(fpca_s2$varprop)
+
+
+
+fpc_s2_gg <- ggplot()+
+  geom_hline(yintercept = 0,colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s2$harmonics$coefs[1:58,5],colour="FPC 5"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s2$harmonics$coefs[1:58,4],colour="FPC 4"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s2$harmonics$coefs[1:58,3],colour="FPC 3"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s2$harmonics$coefs[1:58,2],colour="FPC 2"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s2$harmonics$coefs[1:58,1],colour="FPC 1"))+
+  ylim(-0.6,0.6)+xlab("Frequency (Hz)")+theme_bw(base_size=14)+ylab("") +  scale_colour_viridis(name="Functional PCs", option = "turbo", discrete=T, direction = -1, begin = 0.15, end = 0.85)
+
+
+
+#----------- state 3
+fooof_s3 <- t(as.matrix(fooof_ages915_stacked)[FHMM_915_index_s3,1:58]) 
+fpca_data_s3 <- fda::Data2fd(y=fooof_s3, argvals = c(seq(1.5,30,by=0.5)))
+fpca_s3 <- fda::pca.fd(fpca_data_s3, nharm = 8, harmfdPar=fdPar(fpca_data_s3),centerfns=TRUE)
+
+fpca_s3
+plot(fpca_s3$harmonics, lwd = 1)
+#summary(fpca_s3)
+fpca_s3$varprop
+plot(fpca_s3$varprop)
+
+cumsum(fpca_s3$varprop)
+
+
+
+fpc_s3_gg <- ggplot()+
+  geom_hline(yintercept = 0,colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s3$harmonics$coefs[1:58,5],colour="FPC 5"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s3$harmonics$coefs[1:58,4],colour="FPC 4"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s3$harmonics$coefs[1:58,3],colour="FPC 3"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s3$harmonics$coefs[1:58,2],colour="FPC 2"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s3$harmonics$coefs[1:58,1],colour="FPC 1"))+
+  ylim(-0.6,0.6)+xlab("Frequency (Hz)")+theme_bw(base_size=14)+ylab("") +  scale_colour_viridis(name="Functional PCs", option = "turbo", discrete=T, direction = -1, begin = 0.15, end = 0.85)
+
+
+#----------- state 4
+fooof_s4 <- t(as.matrix(fooof_ages915_stacked)[FHMM_915_index_s4,1:58]) 
+fpca_data_s4 <- fda::Data2fd(y=fooof_s4, argvals = c(seq(1.5,30,by=0.5)))
+fpca_s4 <- fda::pca.fd(fpca_data_s4, nharm = 8, harmfdPar=fdPar(fpca_data_s4),centerfns=TRUE)
+
+fpca_s4
+plot(fpca_s4$harmonics, lwd = 1)
+#summary(fpca_s4)
+fpca_s4$varprop
+plot(fpca_s4$varprop)
+
+
+
+fpc_s4_gg <- ggplot()+
+  geom_hline(yintercept = 0,colour="black")+
+  #geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s4$harmonics$coefs[1:58,6]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s4$harmonics$coefs[1:58,5],colour="FPC 5"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s4$harmonics$coefs[1:58,4],colour="FPC 4"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s4$harmonics$coefs[1:58,3],colour="FPC 3"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s4$harmonics$coefs[1:58,2],colour="FPC 2"))+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fpca_s4$harmonics$coefs[1:58,1],colour="FPC 1"))+
+  ylim(-0.6,0.6)+xlab("Frequency (Hz)")+theme_bw(base_size=14)+ylab("") +  scale_colour_viridis(name="Functional PCs", option = "turbo", discrete=T, direction = -1, begin = 0.15, end = 0.85)
+
+
+
+
+#FPCA PLOTS
+
+
+
+plot(fpca_s1$varprop)
+plot(cumsum(fpca_s1$varprop))
+fpc_s1_gg
+
+plot(fpca_s2$varprop)
+plot(cumsum(fpca_s2$varprop))
+fpc_s2_gg
+
+plot(fpca_s3$varprop)
+plot(cumsum(fpca_s3$varprop))
+fpc_s3_gg
+
+
+plot(fpca_s4$varprop)
+plot(cumsum(fpca_s4$varprop))
+fpc_s4_gg
+
+
+fpc_s1_gg
+fpc_s2_gg
+fpc_s3_gg
+fpc_s4_gg
+
+
+
+#---------
+
+# Exploring structure of FPCA results
+
+#str(fpca_s1)
+
+# SCORES
+
+
+tiff("FPCA_harmonics_s1_130423.tif", compression = "lzw",width = 1000, height = 600, pointsize = 12)
+fpc_s1_gg
+dev.off()  
+
+
+
+tiff("FPCA_harmonics_s2_130423.tif", compression = "lzw",width = 1000, height = 600, pointsize = 12)
+fpc_s2_gg
+dev.off()  
+
+
+tiff("FPCA_harmonics_s3_130423.tif", compression = "lzw",width = 1000, height = 600, pointsize = 12)
+fpc_s3_gg
+dev.off()  
+
+
+tiff("FPCA_harmonics_s4_130423.tif", compression = "lzw",width = 1000, height = 600, pointsize = 12)
+fpc_s4_gg
+dev.off()  
+
+
+
+
+
+# SCREE PLOTS
+png("s1_fpca_scree.png", width = 900, height = 600, pointsize = 18)
+plot(fpca_s1$varprop, xlab = "Functional Principal Component", ylab = "Proportion of Variance Explained", main = "Scree plot for State 1 FPCA")
+dev.off()
+
+
+png("s2_fpca_scree.png", width = 900, height = 600, pointsize = 18)
+plot(fpca_s2$varprop, xlab = "Functional Principal Component", ylab = "Proportion of Variance Explained", main = "Scree plot for State 2 FPCA")
+dev.off()
+
+png("s3_fpca_scree.png", width = 900, height = 600, pointsize = 18)
+plot(fpca_s3$varprop, xlab = "Functional Principal Component", ylab = "Proportion of Variance Explained", main = "Scree plot for State 3 FPCA")
+dev.off()
+
+png("s4_fpca_scree.png", width = 900, height = 600, pointsize = 18)
+plot(fpca_s4$varprop, xlab = "Functional Principal Component", ylab = "Proportion of Variance Explained", main = "Scree plot for State 4 FPCA")
+dev.off()
+
+
+
+```
+
+
+
+
+# Calculating mean FPC scores by individual...
+
+- 'scores' matrix - rows = all PSDs in that state (individuals merged together)
+
+
+- TAKE scores matrix, add column which specifies individual study ID
+- group by study ID
+- calculate colMeans within individual
+--> Gives average loading by individual onto each FPC
+
+```{r}
+
+# Calculate mean FPC scores for each individual by state
+
+
+# state 1 - 305 visitors
+
+fpc_s1_scores_df <- data.frame(fpca_s1$scores)
+names(fpc_s1_scores_df) <- c("fpc1_score","fpc2_score","fpc3_score","fpc4_score","fpc5_score","fpc6_score","fpc7_score","fpc8_score")
+names(fpc_s1_scores_df)[1:8] <- paste0("s1_",names(fpc_s1_scores_df[1:8]))
+# Add column with study IDs
+EID_180_each <- rep(demog_health_states_df_915$EID,each=180)
+
+fpc_s1_scores_df$EID <- EID_180_each[FHMM_915_index_s1]
+
+fpc_s1_score_means <- fpc_s1_scores_df %>% group_by(EID) %>% summarise(across(s1_fpc1_score:s1_fpc8_score, ~ mean(.x))) #colMeans - average loading by individual
+
+#---
+# state 2 - 163 visitors
+
+fpc_s2_scores_df <- data.frame(fpca_s2$scores)
+names(fpc_s2_scores_df) <- c("fpc1_score","fpc2_score","fpc3_score","fpc4_score","fpc5_score","fpc6_score","fpc7_score","fpc8_score")
+names(fpc_s2_scores_df)[1:8] <- paste0("s2_",names(fpc_s2_scores_df[1:8]))
+
+# Add column with study IDs
+EID_180_each <- rep(demog_health_states_df_915$EID,each=180)
+
+fpc_s2_scores_df$EID <- EID_180_each[FHMM_915_index_s2]
+
+fpc_s2_score_means <- fpc_s2_scores_df %>% group_by(EID) %>% summarise(across(s2_fpc1_score:s2_fpc8_score, ~ mean(.x))) #colMeans - average loading by individual
+
+#---
+ #state 3 - 256 visitors
+
+fpc_s3_scores_df <- data.frame(fpca_s3$scores)
+names(fpc_s3_scores_df) <- c("fpc1_score","fpc2_score","fpc3_score","fpc4_score","fpc5_score","fpc6_score","fpc7_score","fpc8_score")
+names(fpc_s3_scores_df)[1:8] <- paste0("s3_",names(fpc_s3_scores_df[1:8]))
+
+# Add column with study IDs
+EID_180_each <- rep(demog_health_states_df_915$EID,each=180)
+
+fpc_s3_scores_df$EID <- EID_180_each[FHMM_915_index_s3]
+
+fpc_s3_score_means <- fpc_s3_scores_df %>% group_by(EID) %>% summarise(across(s3_fpc1_score:s3_fpc8_score, ~ mean(.x))) #colMeans - average loading by individual
+
+#---
+
+# state 4 - 121  visitors
+
+fpc_s4_scores_df <- data.frame(fpca_s4$scores)
+names(fpc_s4_scores_df) <- c("fpc1_score","fpc2_score","fpc3_score","fpc4_score","fpc5_score","fpc6_score","fpc7_score","fpc8_score")
+names(fpc_s4_scores_df)[1:8] <- paste0("s4_",names(fpc_s4_scores_df[1:8]))
+
+# Add column with study IDs
+EID_180_each <- rep(demog_health_states_df_915$EID,each=180)
+
+fpc_s4_scores_df$EID <- EID_180_each[FHMM_915_index_s4]
+
+fpc_s4_score_means <- fpc_s4_scores_df %>% group_by(EID) %>% summarise(across(s4_fpc1_score:s4_fpc8_score, ~ mean(.x))) #colMeans - average loading by individual
+
+
+#--------
+
+
+
+
+# LEFT JOIN ONTO demog_health_states_df_915
+demog_health_states_fpcs_df_915 <- demog_health_states_df_915_fewer_outcomes
+
+demog_health_states_fpcs_df_915 <- left_join(demog_health_states_fpcs_df_915,fpc_s1_score_means,by="EID")
+demog_health_states_fpcs_df_915 <- left_join(demog_health_states_fpcs_df_915,fpc_s2_score_means,by="EID")
+demog_health_states_fpcs_df_915 <- left_join(demog_health_states_fpcs_df_915,fpc_s3_score_means,by="EID")
+demog_health_states_fpcs_df_915 <- left_join(demog_health_states_fpcs_df_915,fpc_s4_score_means,by="EID")
+
+demog_health_states_fpcs_df_915 <- rename(demog_health_states_fpcs_df_915, "MFQ_SR_Total" = "MFQ_SR_Total..1")
+
+view(demog_health_states_fpcs_df_915) # DA MASTER SHEET
+
+
+names(demog_health_states_fpcs_df_915)
+
+
+
+#save(demog_health_states_fpcs_df_915, file="demog_health_states_fpcs_df_915_080423")
+
+load("demog_health_states_fpcs_df_915_080423")
+
+
+
+```
+
+
+
+# Multivariate BRMS for mental health & cognitive function scores 
+
+(for subsets: >80% dominant?? OR? just dominant? OR? **visits at all?**) - probably visits at all makes most sense
+
+
+
+# NEED TO RUN AGAIN BELOW
+# is there a way to include state_percent without multicollinearity issues???
+
+https://stats.stackexchange.com/questions/183601/interpreting-proportions-that-sum-to-one-as-independent-variables-in-linear-regr
+
+```{r}
+library(brms)
+
+names(demog_health_states_fpcs_df_915)
+
+
+#demog_health_states_fpcs_df_915 <- demog_health_states_fpcs_df_915 %>% rename(Cog_NIH7_Card = NIH7_Card,Cog_NIH7_Flanker = NIH7_Flanker,Cog_NIH7_List = NIH7_List,Cog_NIH7_Pattern = NIH7_Pattern)
+
+
+
+# SET SEX TO BE FACTOR
+
+#demog_health_states_fpcs_df_915$Sex <- as.factor(demog_health_states_fpcs_df_915$Sex)
+
+
+
+#------
+
+# State 1 (red)
+s1_brms_df <- demog_health_states_fpcs_df_915 %>% filter(dominant_state==1) #(s2_percent >= 0.8)
+
+mv_brms_s1_formula <- bf(mvbind(MFQ_SR_Total, SCARED_SR_Total, YSR_Ext_T, YSR_Int_T, Cog_NIH7_Card, Cog_NIH7_Flanker, Cog_NIH7_List, Cog_NIH7_Pattern) ~ Sex + Age + EHQ_Total + n_states_visited + n_transitions_all + dominant_proportion + s1_fpc1_score + s1_fpc2_score + s1_fpc3_score + s1_fpc4_score + s1_fpc5_score) +
+  set_rescor(TRUE) #s1_percent + s2_percent + s3_percent + s4_percent +
+
+
+
+
+fit_brm_s1 <- brm(mv_brms_s1_formula, data = s1_brms_df, iter=10000)
+
+summary(fit_brm_s1)
+
+save(fit_brm_s1,file="brms_s1_080423")
+#load("brms_s1_080423")
+
+
+#------
+
+# State 2 (green)
+s2_brms_df <- demog_health_states_fpcs_df_915 %>% filter(dominant_state==2) #(s2_percent >= 0.8)
+
+mv_brms_s2_formula <- bf(mvbind(MFQ_SR_Total, SCARED_SR_Total, YSR_Ext_T, YSR_Int_T, Cog_NIH7_Card, Cog_NIH7_Flanker, Cog_NIH7_List, Cog_NIH7_Pattern) ~ Sex + Age + EHQ_Total + n_states_visited + n_transitions_all + dominant_proportion + s2_fpc1_score + s2_fpc2_score + s2_fpc3_score + s2_fpc4_score + s2_fpc5_score) +
+  set_rescor(TRUE) #s1_percent + s2_percent + s3_percent + s4_percent +
+
+
+
+
+
+fit_brm_s2 <- brm(mv_brms_s2_formula, data = s2_brms_df, iter=10000)
+
+summary(fit_brm_s2)
+
+save(fit_brm_s2,file="brms_s2_080423")
+#load("brms_s2_080423")
+
+#-------
+
+# State 3 (orange)
+s3_brms_df <- demog_health_states_fpcs_df_915 %>% filter(dominant_state==3) #(s2_percent >= 0.8)
+
+mv_brms_s3_formula <- bf(mvbind(MFQ_SR_Total, SCARED_SR_Total, YSR_Ext_T, YSR_Int_T, Cog_NIH7_Card, Cog_NIH7_Flanker, Cog_NIH7_List, Cog_NIH7_Pattern) ~ Sex + Age + EHQ_Total + n_states_visited + n_transitions_all + dominant_proportion + s3_fpc1_score + s3_fpc2_score + s3_fpc3_score + s3_fpc4_score + s3_fpc5_score) +
+  set_rescor(TRUE) #s1_percent + s2_percent + s3_percent + s4_percent +
+
+
+fit_brm_s3 <- brm(mv_brms_s3_formula, data = s3_brms_df, iter=10000)
+
+summary(fit_brm_s3)
+
+save(fit_brm_s3,file="brms_s3_080423")
+#load("brms_s3_080423")
+
+
+
+#---------
+
+# State 4 (blue)
+s4_brms_df <- demog_health_states_fpcs_df_915 %>% filter(dominant_state==4) #(s2_percent >= 0.8)
+
+mv_brms_s4_formula <- bf(mvbind(MFQ_SR_Total, SCARED_SR_Total, YSR_Ext_T, YSR_Int_T, Cog_NIH7_Card, Cog_NIH7_Flanker, Cog_NIH7_List, Cog_NIH7_Pattern) ~ Sex + Age + EHQ_Total + n_states_visited + n_transitions_all + dominant_proportion + s4_fpc1_score + s4_fpc2_score + s4_fpc3_score + s4_fpc4_score + s4_fpc5_score) +
+  set_rescor(TRUE) #s1_percent + s2_percent + s3_percent + s4_percent +
+
+
+fit_brm_s4 <- brm(mv_brms_s4_formula, data = s4_brms_df, iter=10000)
+
+summary(fit_brm_s4)
+
+save(fit_brm_s4,file="brms_s4_080423")
+#load("brms_s4_080423")
+
+
+
+#---------
+
+# Load BRMS models
+
+load("brms_s1_080423")
+load("brms_s2_080423")
+load("brms_s3_080423")
+load("brms_s4_080423")
+
+
+```
+
+
+
+# BRMS models summarise in LaTeX tables
+
+```{r}
+library(modelsummary)
+
+modelsummary(fit_brm_s1, output = "latex",mc.cores = 6,
+             estimate = "{estimate}[{conf.low}, {conf.high}]",
+             statistic=NULL,
+            coef_omit = "Intercept")
+
+modelsummary(fit_brm_s3, output = "latex",mc.cores = 6,
+             estimate = "{estimate}[{conf.low}, {conf.high}]",
+             statistic=NULL,
+            coef_omit = "Intercept")
+
+#-------
+
+library(gtsummary)
+
+tbl_regression(fit_brm_s1, exponentiate = F, intercept = F) %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html() #gt::as_latex()
+
+
+
+
+tbl_regression(fit_brm_s3, exponentiate = F, intercept = F) %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html() 
+
+
+
+# SUPPMATS
+# state 2
+
+tbl_regression(fit_brm_s2, exponentiate = F, intercept = F) %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html() 
+
+
+
+# state 4
+tbl_regression(fit_brm_s4, exponentiate = F, intercept = F) %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html() 
+
+brms::bayes_R2(fit_brm_s4)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

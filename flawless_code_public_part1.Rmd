@@ -1,0 +1,3789 @@
+---
+title: "flawless_code_public_part1"
+author: "Owen Forbes"
+date: "06/10/2023"
+output: html_document
+---
+
+# Part 1 - Code accompanying paper "Functional analysis within latent states: A novel framework for analysing functional time series data"
+
+```{r setup}
+
+
+# Packages
+library(rmatio) # 0.14.0 - for importing .mat tensor/array of matrices (spectrogram output of multitaper analysis)
+library(ForeCA) # for spectral entropy - to be run on cleaned EEG time series per channel
+library(tidyverse) # for magrittr piping, ggplot, etc
+library(fdapace) # for fPCA
+
+
+#HMM
+#library(depmixS4)
+
+library(hmmhdd)
+
+
+library(reticulate) # for FOOOF
+
+
+```
+
+
+# Set up envt for FOOOF
+```{r}
+
+#reticulate::conda_create(envname="FOOOF_env", packages = "fooof==1.0.0")
+
+
+#reticulate::conda_install(envname='FOOOF_env', packages = "matplotlib")
+
+reticulate::use_condaenv("FOOOF_env")
+
+
+```
+
+
+# read in test data
+
+```{r}
+test_cmi_1 <- read.mat("/Volumes/Owen_SSD/CMIhbn_data/EEG_RS/preprocessed_mt_v5_1181/NDARAA075AMK_mt_v5.mat")
+
+plot(test_cmi_1$f, colMeans(test_cmi_1$S),type='l')
+
+
+# Each MT -> S = 205 x 363 (power at 205 frequencies 0-100 hz, x Time 363 seconds)
+names(test_cmi_1)
+head(test_cmi_1)
+
+```
+
+
+```{r}
+CHMibn_mt_v5 <- list.files(path="/Volumes/Owen_SSD/CMIhbn_data/EEG_RS/preprocessed_mt_v5_1181", pattern="*.mat", full.names=TRUE, recursive=FALSE)
+
+mt_test_f_index <-  test_cmi_1$f
+
+
+dim_mt_array <- c(length(test_cmi_1$t),length(test_cmi_1$f),length(CHMibn_mt_v5))
+dim_mt_array
+
+multitaper_1181_store <- array(dim = dim_mt_array) #58 x 363 matrices x 1181 slices (58 freqs = length(seq(0.5,30,by=0.5)))
+
+
+# Read in all 1181 matlab files
+
+multitaper_1181_store <- lapply(CHMibn_mt_v5, R.matlab::readMat)
+
+#change names to CMIHBN codes
+names(multitaper_1181_store) <- stringr::str_replace(CHMibn_mt_v5, pattern = "_mt_v5.mat", replacement = "")
+names(multitaper_1181_store) <- stringr::str_replace(names(multitaper_1181_store), pattern = "/Volumes/Owen_SSD/CMIhbn_data/EEG_RS/preprocessed_mt_v5_1181/", replacement = "")
+
+
+
+# Keep S only 
+
+multitaper_1181_S_only <- lapply(multitaper_1181_store, function(x) x$S)
+
+
+
+#----------------------
+
+# READ IN Eyes closed time stamps
+
+EC_timestamps_directory <- list.files(path="/Volumes/Owen_SSD/CMIhbn_data/EEG_RS/ECtimes_mt_v3_1181", pattern="*.mat", full.names=TRUE, recursive=FALSE)
+
+EC_timestamps_list <-  lapply(EC_timestamps_directory, read.mat)
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Checking matching by ID here...
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+names(EC_timestamps_list) <- stringr::str_replace(EC_timestamps_directory, pattern = "_EC_times_v1.mat", replacement = "")
+names(EC_timestamps_list) <- stringr::str_replace(names(EC_timestamps_list), pattern = "/Volumes/Owen_SSD/CMIhbn_data/EEG_RS/ECtimes_mt_v3_1181/", replacement = "")
+
+setdiff(names(EC_timestamps_list),names(multitaper_1181_store))
+
+
+# No difference!
+
+
+#-----------
+
+# specify indices for which type = '30' (eyes closed) and '20' (eyes open)
+test_events <- read.mat("/Volumes/Owen_SSD/CMIhbn_data/EEG_RS/ECtimes_mt_v3_1181/NDARAA075AMK_EC_times_v1.mat")
+match("30",test_events$event_type) #position of first eyes-closed time marker
+
+#--------------
+
+
+# Trimming out EC sections following first EC section
+EC_timestamps_selected <- lapply(EC_timestamps_list, function(x) x$event_time[c((match("30",x$event_type)):(match("30",x$event_type)+9))])
+
+
+
+#-----------
+
+# get EC time stamps and divide by 500 (500 Hz --> 1 second time stamps for start/end of eyes closed sections)
+EC_timestamps_selected <-  lapply(EC_timestamps_selected, function(x) x/500) 
+
+# Round to nearest second
+EC_timestamps_seconds <-  lapply(EC_timestamps_selected, function(x) round(as.numeric(x[]), digits=0)) 
+
+# BUFFER - #trim leading and trailing TWO seconds off each EC section 
+EC_timestamps_seconds <-  lapply(EC_timestamps_seconds, function(x) x + c(2,-3,2,-3,2,-3,2,-3,2,-3)) 
+
+#--------------
+
+# Trim out eyes closed sections -- greater than EC start, less than next EO start time...
+
+multitaper_1181_S_EC_trimmed <- multitaper_1181_S_only
+
+
+for(i in 1:1181){
+  temp_mt <- multitaper_1181_S_EC_trimmed[[i]]
+  EC_trimmed <- temp_mt[c(EC_timestamps_seconds[[i]][1]:EC_timestamps_seconds[[i]][2],EC_timestamps_seconds[[i]][3]:EC_timestamps_seconds[[i]][4],EC_timestamps_seconds[[i]][5]:EC_timestamps_seconds[[i]][6],EC_timestamps_seconds[[i]][7]:EC_timestamps_seconds[[i]][8],EC_timestamps_seconds[[i]][9]:EC_timestamps_seconds[[i]][10]),]
+  
+  multitaper_1181_S_EC_trimmed[[i]] <- EC_trimmed
+}
+
+
+
+# CHECK FOR continuity/jumps between EC segments at snipped borders
+# 
+# plot(multitaper_1181_S_EC_trimmed[[1]][18,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[1]][19,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[1]][36,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[1]][37,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[1]][54,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[1]][55,], type = 'l')
+# 
+# 
+# 
+# plot(multitaper_1181_S_EC_trimmed[[2]][18,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[2]][19,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[2]][36,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[2]][37,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[2]][54,], type = 'l')
+# plot(multitaper_1181_S_EC_trimmed[[2]][55,], type = 'l')
+# 
+
+
+#-------------
+
+# Calculate RELATIVE alpha power
+
+
+
+# PROBLEMS - 10 SHORT RECORDINGS (interrupted full session?) learned from looping through for loop... missing some data / recordings cut short
+# cut 51
+# cut 354
+# cut 357
+# cut 453
+# cut 511
+# cut 536
+# cut 567
+# cut 752
+# cut 816
+# cut 853
+
+
+# Found another one - too long (broken time sequence labels)
+match("NDARFX721WR8",  names(multitaper_1181_S_EC_trimmed))
+
+# = 313
+
+problem_indices <- c(51,313,354,357,453,511,536,567,752,816,853)
+
+# ALSO Broken 20Hz ones from manual screening in playing_fpca
+broken_20Hz_indices <- c(181,206,227,494,526,582,785,817,880,975,1021,1173)
+
+problem_indices <-  c(problem_indices,broken_20Hz_indices)
+
+length(problem_indices) #23 - 1181-23 = 1158 remaining
+kept_indices <- 1:1181
+
+kept_indices <- kept_indices[! kept_indices %in% problem_indices]
+
+
+#as.dataframe for 1181
+
+multitaper_1181_S_EC_trimmed <- lapply(multitaper_1181_S_EC_trimmed,function(x) as.data.frame(x))
+
+# remove the incomplete recordings 
+#multitaper_1158_kept <- multitaper_1181_S_EC_trimmed[kept_indices]
+
+#!!!!!!!!!!!! CHANGE THIS BACK - JUST TESTING ON A SUBSET SINCE THE FULL DATASET TAKES AGES
+
+multitaper_1158_3D <- multitaper_1181_S_EC_trimmed[kept_indices] #about 10,000 rows
+
+
+
+# create one long dataframe - stacked time (rows = 190s per individual (5 * 38s sections) * columns = frequencies (205 bins))
+multitaper_1158_kept <- as.matrix(data.table::rbindlist(multitaper_1158_3D))
+
+study_id_1158 <- names(multitaper_1181_S_EC_trimmed)[kept_indices]
+save(study_id_1158,file="study_id_1158")
+```
+
+
+
+
+# Try FOOOF
+
+
+Test data for FOOOF one example
+```{r}
+
+demo_f <- test_cmi_1$f
+demo_psd <- test_cmi_1$S[102,]
+```
+
+# Dedicated Python chunk to test FOOOF
+```{python}
+
+# convert to numpy arrays
+
+import numpy as np
+
+py_demo_f = np.array(r.demo_f)
+py_demo_psd = np.array(r.demo_psd)
+
+from fooof import FOOOF
+
+fm1 = FOOOF(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])
+fm2 = FOOOF(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])
+
+fm1.fit(py_demo_f,py_demo_psd)
+fm2.fit(py_demo_f, py_demo_psd)
+
+#(fm1.freqs, fm1._spectrum_flat)
+
+
+```
+
+
+
+
+```{r}
+plot(test_cmi_1$f,test_cmi_1$S[102,],type='l')
+
+plot(py$fm1$freqs, py$fm1$fooofed_spectrum_,type='l')
+
+plot(py$fm2$freqs, py$fm2$fooofed_spectrum_,type='l')
+
+```
+
+
+
+
+
+
+
+#v2 - run FOOOF on 1158
+
+
+
+# v2 - converting to run over full 1158 list
+
+# Didn't work - try 200 at a time
+
+```{r}
+
+str(multitaper_1158_kept)
+
+200*180 #36000
+
+multitaper_1st200 <- as.matrix(multitaper_1158_kept[0*36000+1:36000,])
+
+multitaper_2st200 <- as.matrix(multitaper_1158_kept[1*36000+1:36000,])
+
+multitaper_3st200 <- as.matrix(multitaper_1158_kept[2*36000+1:36000,])
+
+multitaper_4st200 <- as.matrix(multitaper_1158_kept[3*36000+1:36000,])
+
+multitaper_5st200 <- as.matrix(multitaper_1158_kept[4*36000+1:36000,])
+
+multitaper_6st200 <- as.matrix(multitaper_1158_kept[(5*36000):(1158*180),])
+
+
+```
+
+# Run FOOOF on batches of 200 at a time (36000 rows) 
+
+```{python}
+
+
+# 
+# # convert to numpy arrays
+# 
+# import numpy as np
+# 
+# import matplotlib as mpl
+# 
+# from fooof import FOOOFGroup
+# 
+# py_demo_f = np.array(r.demo_f)
+# py_array_1158psds = np.array(r.multitaper_1158_kept)
+# 
+# # 
+# # 
+# # fgtest = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+# # 
+# # 
+# # fgtest.fit(py_demo_f,py_array_1158psds)
+# # 
+# # fgtest.save_report(file_name = 'fooof_20_report')
+# # 
+# # 
+# # fgtest.save(file_name='fooof_20_results', save_results=True)
+# # 
+# 
+# 
+# #----------------------------------
+# 
+# 
+# # Try with a knee and compare the GOF results
+# 
+# fgtest_KNEE = FOOOFGroup(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+# 
+# 
+# 
+# 
+# fgtest_KNEE.fit(py_demo_f,py_array_1158psds,progress='tqdm', n_jobs=8) #results stored in py$fgtest_KNEE$group_results
+# # This didn't work for 1158 - got stuck
+# 
+# fgtest_KNEE.save_report(file_name = 'fooof_1158_report_KNEE')
+# 
+# 
+# fgtest_KNEE.save(file_name='fooof_1158_results_KNEE', save_results=True, save_settings=True)# , save_data=True)
+# 
+# 
+# #fgtest_KNEE.fooofed_spectrum_
+# #-------------------------
+# 
+# 
+# # To load in saved file of FOOOF results
+# # 
+# 
+# # 
+# # fgtest_KNEE = FOOOFGroup()
+# # fgtest_KNEE.load('fooof_1158_results_KNEE')
+# 
+# 
+# # 
+# # fgtest_KNEE.print_results()
+# # 
+# # 
+# # fgtest_KNEE.power_spectra #doesn't load?
+
+
+
+
+#---------------
+
+# 1st 200 subset - does it work?
+
+# convert to numpy arrays
+
+import numpy as np
+
+import matplotlib as mpl
+
+from fooof import FOOOFGroup
+
+py_demo_f = np.array(r.demo_f)
+py_array_1st200psds = np.array(r.multitaper_1st200)
+
+# 
+# 
+# fgtest = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+# 
+# 
+# fgtest.fit(py_demo_f,py_array_1st200psds)
+# 
+# fgtest.save_report(file_name = 'fooof_20_report')
+# 
+# 
+# fgtest.save(file_name='fooof_20_results', save_results=True)
+# 
+
+
+#----------------------------------
+
+
+# Try with a knee and compare the GOF results
+
+#fgtest_KNEE_1 = FOOOFGroup(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+
+#-------------------------------
+# Remove KNEE for 1.5-30Hz range
+#-------------------------------
+
+
+fgtest_noKNEE_1 = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+
+
+fgtest_noKNEE_1.fit(py_demo_f,py_array_1st200psds,progress='tqdm', n_jobs=7) #results stored in py$fgtest_noKNEE$group_results
+# This didn't work for 1158 - got stuck
+
+fgtest_noKNEE_1.save_report(file_name = 'fooof_1st200_report_noKNEE')
+
+
+#fgtest_noKNEE_1.save(file_name='fooof_1st200_results_noKNEE', save_results=True, save_settings=True)# , save_data=True)
+
+
+#fgtest_noKNEE.fooofed_spectrum_
+#-------------------------
+
+
+# To load in saved file of FOOOF results
+# 
+
+# 
+# fgtest_KNEE = FOOOFGroup()
+# fgtest_KNEE.load('fooof_1158_results_KNEE')
+
+
+# 
+# fgtest_KNEE.print_results()
+# 
+# 
+# fgtest_KNEE.power_spectra #doesn't load?
+
+
+#---------
+# 2nd set
+
+py_array_2st200psds = np.array(r.multitaper_2st200)
+
+
+#fgtest_KNEE_2 = FOOOFGroup(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+
+fgtest_noKNEE_2 = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+
+
+fgtest_noKNEE_2.fit(py_demo_f,py_array_2st200psds,progress='tqdm', n_jobs=6) #results stored in 
+
+fgtest_noKNEE_2.save_report(file_name = 'fooof_2st200_report_noKNEE')
+
+
+fgtest_noKNEE_2.save(file_name='fooof_2st200_results_noKNEE', save_results=True, save_settings=True)# , save_data=True)
+
+
+
+#---------
+# 3st set
+
+py_array_3st200psds = np.array(r.multitaper_3st200)
+
+#fgtest_KNEE_3 = FOOOFGroup(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+
+fgtest_noKNEE_3 = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+fgtest_noKNEE_3.fit(py_demo_f,py_array_3st200psds,progress='tqdm', n_jobs=6) #results stored in 
+
+fgtest_noKNEE_3.save_report(file_name = 'fooof_3st200_report_noKNEE')
+
+
+fgtest_noKNEE_3.save(file_name='fooof_3st200_results_noKNEE', save_results=True, save_settings=True)# , save_data=True)
+
+
+
+#---------
+# 4st set
+
+py_array_4st200psds = np.array(r.multitaper_4st200)
+
+#fgtest_KNEE_4 = FOOOFGroup(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+fgtest_noKNEE_4 = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+fgtest_noKNEE_4.fit(py_demo_f,py_array_4st200psds,progress='tqdm', n_jobs=6) #results stored in 
+
+fgtest_noKNEE_4.save_report(file_name = 'fooof_4st200_report_noKNEE')
+
+
+fgtest_noKNEE_4.save(file_name='fooof_4st200_results_noKNEE', save_results=True, save_settings=True)# , save_data=True)
+
+
+#---------
+# 5st set
+
+py_array_5st200psds = np.array(r.multitaper_5st200)
+
+#fgtest_KNEE_5 = FOOOFGroup(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+fgtest_noKNEE_5 = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+
+fgtest_noKNEE_5.fit(py_demo_f,py_array_5st200psds,progress='tqdm', n_jobs=6) #results stored in 
+
+fgtest_noKNEE_5.save_report(file_name = 'fooof_5st200_report_noKNEE')
+
+
+fgtest_noKNEE_5.save(file_name='fooof_5st200_results_noKNEE', save_results=True, save_settings=True)# , save_data=True)
+
+
+#---------
+# 6st set
+
+py_array_6st200psds = np.array(r.multitaper_6st200)
+
+#fgtest_KNEE_6 = FOOOFGroup(min_peak_height=0.05, aperiodic_mode='knee', verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+fgtest_noKNEE_6 = FOOOFGroup(min_peak_height=0.05, verbose=True, peak_width_limits = [1, 12])  # Took about 3-5 minutes for 3000
+
+
+fgtest_noKNEE_6.fit(py_demo_f,py_array_6st200psds,progress='tqdm', n_jobs=6) #results stored in 
+
+fgtest_noKNEE_6.save_report(file_name = 'fooof_6st200_report_noKNEE')
+
+
+fgtest_noKNEE_6.save(file_name='fooof_6st200_results_noKNEE', save_results=True, save_settings=True)# , save_data=True)
+
+
+
+```
+#Loading computed FOOOF objects
+```{python}
+
+
+import numpy as np
+
+from fooof import FOOOF
+from fooof import FOOOFGroup
+
+fgtest_noKNEE_1 = FOOOFGroup()
+fgtest_noKNEE_1.load('/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1st200_results_noKNEE.json')
+
+fgtest_noKNEE_2 = FOOOFGroup()
+fgtest_noKNEE_2.load('/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_2st200_results_noKNEE.json')
+
+fgtest_noKNEE_3 = FOOOFGroup()
+fgtest_noKNEE_3.load('/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_3st200_results_noKNEE.json')
+
+fgtest_noKNEE_4 = FOOOFGroup()
+fgtest_noKNEE_4.load('/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_4st200_results_noKNEE.json')
+
+fgtest_noKNEE_5 = FOOOFGroup()
+fgtest_noKNEE_5.load('/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_5st200_results_noKNEE.json')
+
+fgtest_noKNEE_6 = FOOOFGroup()
+fgtest_noKNEE_6.load('/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_6st200_results_noKNEE.json')
+
+```
+
+
+
+
+# Get _peak_fit from each PSD
+
+```{python, eval = F}
+
+#print(fgtest_KNEE.get_params.__doc__)
+
+
+#print(fgtest_KNEE[0].__doc__)
+
+
+#out_2 = fgtest_noKNEE.get_fooof(ind=2, regenerate=True)
+
+#out_2.print_results()
+#out_2.plot()
+
+
+
+
+#-----------
+
+# Need to write a for loop to take outputs from the regenerated full model fits -- or maybe there is a nice vectorised way to do this in Python...
+
+# Dimensions of power_spectra...
+#print(fgtest_noKNEE.power_spectra.shape) #208440,58
+
+#n PSDs = 180 * (N) = 180 * 1158 = 208440
+#n freqs = 58
+
+
+fooof_1st200 = np.empty([36000,58])
+
+inds_36000 = range(0,36000)
+#fooof_208440 = fgtest_noKNEE.get_fooof(ind=inds_208440, regenerate=True) #DOESN'T WORK - asking Tom Donoghue (FOOOF developer) for his advice
+
+for i in inds_36000:
+  temp_fooof = fgtest_noKNEE_1.get_fooof(ind=i, regenerate=True)
+  fooof_1st200[i] = temp_fooof._peak_fit
+  #fooof_1158[i] = temp_fooof.fooofed_spectrum_ # PREVIOUSLY WAS GETTING FOOOFED SPECTRUM - I NEED PEAK_FIT_ (EXCLUDING APERIODIC 1/F COMPONENT)
+  
+#_--------
+
+
+fooof_2st200 = np.empty([36000,58])
+
+inds_36000 = range(0,36000)
+#fooof_208440 = fgtest_noKNEE.get_fooof(ind=inds_208440, regenerate=True) #DOESN'T WORK - asking Tom Donoghue (FOOOF developer) for his advice
+
+for i in inds_36000:
+  temp_fooof = fgtest_noKNEE_2.get_fooof(ind=i, regenerate=True)
+  fooof_2st200[i] = temp_fooof._peak_fit
+  #fooof_1158[i] = temp_fooof.fooofed_spectrum_ # PREVIOUSLY WAS GETTING FOOOFED SPECTRUM - I NEED PEAK_FIT_ (EXCLUDING APERIODIC 1/F COMPONENT)
+  
+#_--------
+
+fooof_3st200 = np.empty([36000,58])
+
+inds_36000 = range(0,36000)
+#fooof_208440 = fgtest_noKNEE.get_fooof(ind=inds_208440, regenerate=True) #DOESN'T WORK - asking Tom Donoghue (FOOOF developer) for his advice
+
+for i in inds_36000:
+  temp_fooof = fgtest_noKNEE_3.get_fooof(ind=i, regenerate=True)
+  fooof_3st200[i] = temp_fooof._peak_fit
+  #fooof_1158[i] = temp_fooof.fooofed_spectrum_ # PREVIOUSLY WAS GETTING FOOOFED SPECTRUM - I NEED PEAK_FIT_ (EXCLUDING APERIODIC 1/F COMPONENT)
+  
+#_--------
+
+fooof_4st200 = np.empty([36000,58])
+
+inds_36000 = range(0,36000)
+#fooof_208440 = fgtest_noKNEE.get_fooof(ind=inds_208440, regenerate=True) #DOESN'T WORK - asking Tom Donoghue (FOOOF developer) for his advice
+
+for i in inds_36000:
+  temp_fooof = fgtest_noKNEE_4.get_fooof(ind=i, regenerate=True)
+  fooof_4st200[i] = temp_fooof._peak_fit
+  #fooof_1158[i] = temp_fooof.fooofed_spectrum_ # PREVIOUSLY WAS GETTING FOOOFED SPECTRUM - I NEED PEAK_FIT_ (EXCLUDING APERIODIC 1/F COMPONENT)
+  
+#_--------
+
+fooof_5st200 = np.empty([36000,58])
+
+inds_36000 = range(0,36000)
+#fooof_208440 = fgtest_noKNEE.get_fooof(ind=inds_208440, regenerate=True) #DOESN'T WORK - asking Tom Donoghue (FOOOF developer) for his advice
+
+for i in inds_36000:
+  temp_fooof = fgtest_noKNEE_5.get_fooof(ind=i, regenerate=True)
+  fooof_5st200[i] = temp_fooof._peak_fit
+  #fooof_1158[i] = temp_fooof.fooofed_spectrum_ # PREVIOUSLY WAS GETTING FOOOFED SPECTRUM - I NEED PEAK_FIT_ (EXCLUDING APERIODIC 1/F COMPONENT)
+  
+#_--------
+
+
+fooof_6st200 = np.empty([28440,58])
+
+inds_28440 = range(0,28440)
+#fooof_208440 = fgtest_noKNEE.get_fooof(ind=inds_208440, regenerate=True) #DOESN'T WORK - asking Tom Donoghue (FOOOF developer) for his advice
+
+for i in inds_28440:
+  temp_fooof = fgtest_noKNEE_6.get_fooof(ind=i, regenerate=True)
+  fooof_6st200[i] = temp_fooof._peak_fit
+  #fooof_1158[i] = temp_fooof.fooofed_spectrum_ # PREVIOUSLY WAS GETTING FOOOFED SPECTRUM - I NEED PEAK_FIT_ (EXCLUDING APERIODIC 1/F COMPONENT)
+  
+#_--------
+
+
+```
+
+
+# Run FHMMs with 1158 * 180 PSDs
+
+
+#### FHMM is NOT WORKING with 1158 ppl psd's -- all states have identical centroids!! oh bother
+
+
+# LEARNT THE LESSON - RESET BT!!!! If using initialised centroids from another FHMM
+
+
+
+```{r}
+plot(py$fooof_1st200[1,],type='l')
+plot(py$fooof_2st200[36000,],type='l')
+plot(py$fooof_3st200[36000,],type='l')
+plot(py$fooof_4st200[36000,],type='l')
+plot(py$fooof_5st200[36000,],type='l')
+plot(py$fooof_6st200[28440,],type='l')
+
+
+# Combine all into one matrix
+
+fooof_1158_stacked <- rbind(as.matrix(py$fooof_1st200),as.matrix(py$fooof_2st200),as.matrix(py$fooof_3st200),as.matrix(py$fooof_4st200),as.matrix(py$fooof_5st200),as.matrix(py$fooof_6st200))
+
+
+
+#-----------------
+
+#save
+
+#save(fooof_1158_stacked, file = "fooof_1158_stacked")
+
+
+# Load
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1158_stacked")
+
+#!!!!!!---------------!!!!!!!!!!
+
+# TESTING with only 0-30 Hz range - how does it perform?
+
+fooofs_1158_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked)))
+
+#!!!!!!---------------!!!!!!!!!!
+
+
+# 
+# alpha_grid <- seq(0,1,length.out=190)
+# alpha_data <- unname(as.matrix(multitaper_1170_S_EC_alphas_relative))
+# 
+# alpha_over_time_for_fhmm <- roahd::fData(grid = alpha_grid, values = alpha_data)
+# str(alpha_over_time_for_fhmm)
+
+#view(fooofs_1158_for_fhmm$data[[1]])
+dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+
+bt <- seq(1,n_tot,by=n)
+
+
+
+#---------
+
+# 1 states
+
+time_1_start <- Sys.time()
+
+fhmm_demo_mt_psd_1 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 1,bT=bt)
+
+fit_fhmm_demo_mt_psd_1 <- fitBM_fhmm(fhmm_demo_mt_psd_1) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_1)
+
+plot(fit_fhmm_demo_mt_psd_1)
+
+estimated_fhmm_states_1 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_1)
+
+psych::describe(estimated_fhmm_states_1)
+
+time_1_end <- Sys.time()
+
+time_1_run <- time_1_end - time_1_start
+
+#---------
+
+# 2 states
+
+time_2_start <- Sys.time()
+
+fhmm_demo_mt_psd_2 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 2,bT=bt)
+
+fit_fhmm_demo_mt_psd_2 <- fitBM_fhmm(fhmm_demo_mt_psd_2) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_2)
+
+#plot(fit_fhmm_demo_mt_psd_2)
+
+estimated_fhmm_states_2 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_2)
+
+psych::describe(estimated_fhmm_states_2)
+
+time_2_end <- Sys.time()
+
+time_2_run <- time_2_end - time_2_start
+
+#---------
+
+# 3 states
+
+time_3_start <- Sys.time()
+
+fhmm_demo_mt_psd_3 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 3,bT=bt)
+
+fit_fhmm_demo_mt_psd_3 <- fitBM_fhmm(fhmm_demo_mt_psd_3) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_3)
+
+#plot(fit_fhmm_demo_mt_psd_3)
+
+estimated_fhmm_states_3 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_3)
+
+psych::describe(estimated_fhmm_states_3)
+
+time_3_end <- Sys.time()
+
+time_3_run <- time_3_end - time_3_start
+#---------
+
+# 4 states
+time_4_start <- Sys.time()
+
+fhmm_demo_mt_psd_4 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 4,bT=bt)
+
+fit_fhmm_demo_mt_psd_4 <- fitBM_fhmm(fhmm_demo_mt_psd_4) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_4)
+
+#plot(fit_fhmm_demo_mt_psd_4)
+
+estimated_fhmm_states_4 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_4)
+
+psych::describe(estimated_fhmm_states_4)
+
+
+time_4_end <- Sys.time()
+
+time_4_run <- time_4_end - time_4_start
+
+#---------
+
+# 5 states
+
+time_5_start <- Sys.time()
+
+fhmm_demo_mt_psd_5 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 5,bT=bt)
+
+fit_fhmm_demo_mt_psd_5 <- fitBM_fhmm(fhmm_demo_mt_psd_5) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_5)
+
+#plot(fit_fhmm_demo_mt_psd_5)
+
+estimated_fhmm_states_5 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_5)
+
+psych::describe(estimated_fhmm_states_5)
+
+time_5_end <- Sys.time()
+
+time_5_run <- time_5_end - time_5_start
+
+#save(fit_fhmm_demo_mt_psd_5,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_5_1158")
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_5_1158")
+
+#---------
+
+
+# 6 states
+
+time_6_start <- Sys.time()
+
+fhmm_demo_mt_psd_6 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 6,bT=bt)
+
+fit_fhmm_demo_mt_psd_6 <- fitBM_fhmm(fhmm_demo_mt_psd_6) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_6)
+
+#plot(fit_fhmm_demo_mt_psd_6)
+
+estimated_fhmm_states_6 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_6)
+hist(estimated_fhmm_states_6)
+
+
+psych::describe(estimated_fhmm_states_6)
+
+time_6_end <- Sys.time()
+
+time_6_run <- time_6_end - time_6_start
+
+#save(fit_fhmm_demo_mt_psd_6,file="fhmm_6_1158")
+
+#load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_6_1158")
+
+
+#-------------
+# LEARNT THE LESSON - RESET BT!!!!
+
+
+# TRYING OUT WITH INITIALISED STATES FROM N = 20 FHMM
+initial_centroids_6state <- fhmm_noKNEE_20_6$centroids
+
+
+time_6_init_test_start <- Sys.time()
+
+fhmm_demo_mt_psd_6_init_test <- set_fhmm(fooofs_1158_for_fhmm,nStates = 6,bT=bt, centroids = initial_centroids_6state)
+
+fit_fhmm_demo_mt_psd_6_init_test <- fitBM_fhmm(fhmm_demo_mt_psd_6_init_test) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_6_init_test)
+
+#plot(fit_fhmm_demo_mt_psd_6_init_test)
+
+estimated_fhmm_states_6_init_test <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_6_init_test) # problem with this???
+
+psych::describe(estimated_fhmm_states_6_init_test)
+
+time_6_init_test_end <- Sys.time()
+
+time_6_init_test_run <- time_6_init_test_end - time_6_init_test_start
+
+save(fit_fhmm_demo_mt_psd_6_init_test,file="fhmm_6_init_test_1158")
+
+#load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_6_init_test_1158")
+
+#-------
+
+# 7 states
+
+time_7_start <- Sys.time()
+
+fhmm_demo_mt_psd_7 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 7,bT=bt)
+
+fit_fhmm_demo_mt_psd_7 <- fitBM_fhmm(fhmm_demo_mt_psd_7) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_7)
+
+#plot(fit_fhmm_demo_mt_psd_7)
+
+estimated_fhmm_states_7 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_7)
+
+psych::describe(estimated_fhmm_states_7)
+hist(estimated_fhmm_states_7)
+
+time_7_end <- Sys.time()
+
+time_7_run <- time_7_end - time_7_start
+
+
+#save(fit_fhmm_demo_mt_psd_7,file="fhmm_7_1158")
+#load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_7_1158")
+#---------
+# 8 states
+
+time_8_start <- Sys.time()
+
+fhmm_demo_mt_psd_8 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 8,bT=bt)
+
+fit_fhmm_demo_mt_psd_8 <- fitBM_fhmm(fhmm_demo_mt_psd_8) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_8)
+
+#plot(fit_fhmm_demo_mt_psd_8)
+
+estimated_fhmm_states_8 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_8)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_8_end <- Sys.time()
+
+time_8_run <- time_8_end - time_8_start
+
+#save(fit_fhmm_demo_mt_psd_8,file="fhmm_8_1158")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_8_1158")
+#---------
+
+
+# 9 states
+
+time_9_start <- Sys.time()
+
+fhmm_demo_mt_psd_9 <- set_fhmm(fooofs_1158_for_fhmm,nStates = 9,bT=bt)
+
+fit_fhmm_demo_mt_psd_9 <- fitBM_fhmm(fhmm_demo_mt_psd_9) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_demo_mt_psd_9)
+
+#plot(fit_fhmm_demo_mt_psd_9)
+
+estimated_fhmm_states_9 <- hmmhdd::viterbi(fit_fhmm_demo_mt_psd_9)
+
+#psych::describe(estimated_fhmm_states_9)
+
+time_9_end <- Sys.time()
+
+time_9_run <- time_9_end - time_9_start
+#---------
+
+
+# Compare BIC's
+
+summary(fit_fhmm_demo_mt_psd_1)
+summary(fit_fhmm_demo_mt_psd_2)
+summary(fit_fhmm_demo_mt_psd_3)
+summary(fit_fhmm_demo_mt_psd_4)
+summary(fit_fhmm_demo_mt_psd_5)
+summary(fit_fhmm_demo_mt_psd_6)
+#summary(fit_fhmm_demo_mt_psd_7)
+summary(fit_fhmm_demo_mt_psd_8)
+summary(fit_fhmm_demo_mt_psd_9)
+
+
+time_1_run
+time_2_run
+time_3_run
+time_4_run
+time_5_run
+time_6_run
+time_7_run
+time_8_run
+time_9_run
+
+
+hist(estimated_fhmm_states_1)
+hist(estimated_fhmm_states_2)
+hist(estimated_fhmm_states_3)
+hist(estimated_fhmm_states_4)
+hist(estimated_fhmm_states_5)
+hist(estimated_fhmm_states_6)
+hist(estimated_fhmm_states_7)
+hist(estimated_fhmm_states_8)
+hist(estimated_fhmm_states_9)
+  
+plot(fit_fhmm_demo_mt_psd_1)
+plot(fit_fhmm_demo_mt_psd_2)
+plot(fit_fhmm_demo_mt_psd_3)
+plot(fit_fhmm_demo_mt_psd_4)
+plot(fit_fhmm_demo_mt_psd_5)
+plot(fit_fhmm_demo_mt_psd_6)
+plot(fit_fhmm_demo_mt_psd_7)
+plot(fit_fhmm_demo_mt_psd_8)
+plot(fit_fhmm_demo_mt_psd_9)
+# 
+
+
+
+
+
+gg_fhmm_2_centroids <- ggplot()+
+  # geom_line(aes(x=c(seq(0.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_2$centroids$data[[1]][5,]),colour="blue")+
+  # geom_line(aes(x=c(seq(0.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_2$centroids$data[[1]][4,]),colour="green")+
+  # geom_line(aes(x=c(seq(0.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_2$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_2$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_2$centroids$data[[1]][1,]),colour="red") # High delta
+
+ gg_fhmm_2_centroids
+ hist(estimated_fhmm_states_2)
+estimated_fhmm_states_2
+
+
+
+
+
+
+gg_fhmm_3_centroids <- ggplot()+
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_3$centroids$data[[1]][5,]),colour="blue")+
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_3$centroids$data[[1]][4,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_3$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_3$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_3$centroids$data[[1]][1,]),colour="red") # High delta
+
+ gg_fhmm_3_centroids
+ hist(estimated_fhmm_states_3)
+estimated_fhmm_states_3
+
+
+
+
+
+
+gg_fhmm_4_centroids <- ggplot()+
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_4$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_4$centroids$data[[1]][4,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_4$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_4$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_4$centroids$data[[1]][1,]),colour="red") # High delta
+
+ gg_fhmm_4_centroids
+ hist(estimated_fhmm_states_4)
+estimated_fhmm_states_4
+
+
+
+# #----------
+# 
+# 
+# 
+# 
+gg_fhmm_5_centroids <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_5$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_5$centroids$data[[1]][1,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_5$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_5$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_5$centroids$data[[1]][4,]),colour="green") # High delta
+
+ gg_fhmm_5_centroids
+ hist(estimated_fhmm_states_5)
+estimated_fhmm_states_5
+
+# 
+# #------------
+# 
+# # CHECKING OUT MODEL FHMM WITH 6 STATES
+# 
+# # Lowest BIC = for 6 (of 1-7)
+fit_fhmm_demo_mt_psd_6$centroids
+
+
+
+gg_fhmm_6_centroids <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6$centroids$data[[1]][1,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6$centroids$data[[1]][4,]),colour="green") # High delta
+
+ gg_fhmm_6_centroids
+ hist(estimated_fhmm_states_6)
+ 
+
+ #------ initialised with states from N=20 plot
+ 
+gg_fhmm_6_centroids_init <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6_init_test$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6_init_test$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6_init_test$centroids$data[[1]][4,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6_init_test$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6_init_test$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_6_init_test$centroids$data[[1]][1,]),colour="red") # High delta
+
+ gg_fhmm_6_centroids_init
+ 
+
+gg_fhmm_7_centroids <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_7$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_7$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_7$centroids$data[[1]][4,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_7$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_7$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_7$centroids$data[[1]][1,]),colour="red") # High delta
+
+ gg_fhmm_7_centroids
+ hist(estimated_fhmm_states_7)
+# 
+#  
+#  
+# 
+gg_fhmm_8_centroids <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][8,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][7,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][4,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][3,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_8$centroids$data[[1]][1,]),colour="red") # High delta
+
+ gg_fhmm_8_centroids
+ hist(estimated_fhmm_states_8)
+
+#  
+#  
+#  
+# 
+# gg_fhmm_9_centroids <- ggplot()+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][9,]),colour="black")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][8,]),colour="brown")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][7,]),colour="grey")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][6,]),colour="purple")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][5,]),colour="blue")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][4,]),colour="green")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][3,]),colour="yellow")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][2,]),colour="orange")+
+#   geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_demo_mt_psd_9$centroids$data[[1]][1,]),colour="red") # High delta
+#   
+#  gg_fhmm_9_centroids
+#  hist(estimated_fhmm_states_9)
+#  
+#  
+#  
+#  #-------
+#  
+# summary(fit_fhmm_demo_mt_psd_6) # BIC = -23593.28
+# summary(fit_fhmm_demo_mt_psd_8) # BIC = -23847.56
+# summary(fit_fhmm_demo_mt_psd_9) # BIC = -23982.52
+# 
+#  gg_fhmm_6_centroids
+#  gg_fhmm_8_centroids
+#  gg_fhmm_9_centroids
+#  
+#  
+# hist(estimated_fhmm_states_6)
+# hist(estimated_fhmm_states_8)
+# hist(estimated_fhmm_states_9)
+# 
+# 
+# 
+# # What does state occupancy look like for one person at a time?
+# 
+# estimated_fhmm_states_9[0*180+1:180] #2 states - 2 and 5
+# estimated_fhmm_states_9[1*180+1:180] #1 state - 5
+# estimated_fhmm_states_9[2*180+1:180] #3 states - 4, 5, 8
+# estimated_fhmm_states_9[3*180+1:180] #1 state - 1
+# estimated_fhmm_states_9[4*180+1:180] #4 states - 2, 3, 5, 8
+# estimated_fhmm_states_9[5*180+1:180] #3 states - 4, 5, 6
+# estimated_fhmm_states_9[6*180+1:180] #1 state - 4
+# estimated_fhmm_states_9[7*180+1:180] #1 state - 8
+# estimated_fhmm_states_9[8*180+1:180] #1 state - 7
+# estimated_fhmm_states_9[9*180+1:180] #4 states - 1, 3, 7, 8
+# estimated_fhmm_states_9[10*180+1:180] #1 state - 1
+# estimated_fhmm_states_9[11*180+1:180] #1 state - 6
+# estimated_fhmm_states_9[12*180+1:180] #2 states - 5, 6
+# estimated_fhmm_states_9[13*180+1:180] #1 state - 4
+# estimated_fhmm_states_9[14*180+1:180] #2 states - 4, 8
+# estimated_fhmm_states_9[15*180+1:180] #2 states - 2, 5
+# estimated_fhmm_states_9[16*180+1:180] #1 state - 3
+# estimated_fhmm_states_9[17*180+1:180] #1 state - 4
+# estimated_fhmm_states_9[18*180+1:180] #3 states - 8, 2, 1
+# estimated_fhmm_states_9[19*180+1:180] #1 state - 9
+# 
+
+
+#---------
+
+# check out plot of states vs log likelihood
+
+plot(1:9,c(fit_fhmm_demo_mt_psd_1$logLike,fit_fhmm_demo_mt_psd_2$logLike,fit_fhmm_demo_mt_psd_3$logLike,fit_fhmm_demo_mt_psd_4$logLike,fit_fhmm_demo_mt_psd_5$logLike,fit_fhmm_demo_mt_psd_6$logLike,fit_fhmm_demo_mt_psd_7$logLike,fit_fhmm_demo_mt_psd_8$logLike,fit_fhmm_demo_mt_psd_9$logLike))
+
+# Check out plot of states vs BIC
+
+plot(1:9,c(hmmhdd::bic(fit_fhmm_demo_mt_psd_1),hmmhdd::bic(fit_fhmm_demo_mt_psd_2),hmmhdd::bic(fit_fhmm_demo_mt_psd_3),hmmhdd::bic(fit_fhmm_demo_mt_psd_4),hmmhdd::bic(fit_fhmm_demo_mt_psd_5),hmmhdd::bic(fit_fhmm_demo_mt_psd_6),hmmhdd::bic(fit_fhmm_demo_mt_psd_7),hmmhdd::bic(fit_fhmm_demo_mt_psd_8),hmmhdd::bic(fit_fhmm_demo_mt_psd_9)))
+
+
+
+#--------
+
+gg_fhmm_5_centroids
+gg_fhmm_6_centroids
+gg_fhmm_8_centroids
+gg_fhmm_6_centroids_init
+
+
+hist(estimated_fhmm_states_5)
+
+hist(estimated_fhmm_states_6)
+
+hist(estimated_fhmm_states_8)
+
+
+fit_fhmm_demo_mt_psd_6_init_test$A
+
+
+```
+
+
+
+# Kerrie advice 10/11/2022
+
+# Run 6 models with 8-states on random 80% subset of 1158 - to identify stable sets...    
+
+
+```{r}
+
+# Define indices for random subsets
+# 80% of 1158 = 927
+
+set.seed(122)
+# 
+# subset_80p_1158_index1 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index2 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index3 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index4 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index5 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index6 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index7 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index8 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index9 <- sort(sample.int(1158,927,replace=F))
+# subset_80p_1158_index10 <- sort(sample.int(1158,927,replace=F))
+
+
+# 
+# save(subset_80p_1158_index1,file="subset_80p_1158_index1")
+# save(subset_80p_1158_index2,file="subset_80p_1158_index2")
+# save(subset_80p_1158_index3,file="subset_80p_1158_index3")
+# save(subset_80p_1158_index4,file="subset_80p_1158_index4")
+# save(subset_80p_1158_index5,file="subset_80p_1158_index5")
+# save(subset_80p_1158_index6,file="subset_80p_1158_index6")
+# save(subset_80p_1158_index7,file="subset_80p_1158_index7")
+# save(subset_80p_1158_index8,file="subset_80p_1158_index8")
+# save(subset_80p_1158_index9,file="subset_80p_1158_index9")
+# save(subset_80p_1158_index10,file="subset_80p_1158_index10")
+
+
+
+
+
+
+load("subset_80p_1158_index1")
+load("subset_80p_1158_index2")
+load("subset_80p_1158_index3")
+load("subset_80p_1158_index4")
+load("subset_80p_1158_index5")
+load("subset_80p_1158_index6")
+load("subset_80p_1158_index7")
+load("subset_80p_1158_index8")
+load("subset_80p_1158_index9")
+load("subset_80p_1158_index10")
+
+#-----------
+
+list_subset_1 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_1)){
+  list_subset_1[[i]] <- ((subset_80p_1158_index1[i]-1)*180) + (1:180)
+}
+
+index_subset_1 <- as.vector(unlist(list_subset_1))
+
+#-----------
+
+list_subset_2 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_2)){
+  list_subset_2[[i]] <- ((subset_80p_1158_index2[i]-1)*180) + (1:180)
+}
+
+index_subset_2 <- as.vector(unlist(list_subset_2))
+
+#-----------
+
+list_subset_3 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_3)){
+  list_subset_3[[i]] <- ((subset_80p_1158_index3[i]-1)*180) + (1:180)
+}
+
+index_subset_3 <- as.vector(unlist(list_subset_3))
+
+#-----------
+
+list_subset_4 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_4)){
+  list_subset_4[[i]] <- ((subset_80p_1158_index4[i]-1)*180) + (1:180)
+}
+
+index_subset_4 <- as.vector(unlist(list_subset_4))
+
+#-----------
+
+list_subset_5 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_5)){
+  list_subset_5[[i]] <- ((subset_80p_1158_index5[i]-1)*180) + (1:180)
+}
+
+index_subset_5 <- as.vector(unlist(list_subset_5))
+
+#-----------
+
+list_subset_6 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_6)){
+  list_subset_6[[i]] <- ((subset_80p_1158_index6[i]-1)*180) + (1:180)
+}
+
+index_subset_6 <- as.vector(unlist(list_subset_6))
+#---------
+
+
+list_subset_7 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_7)){
+  list_subset_7[[i]] <- ((subset_80p_1158_index7[i]-1)*180) + (1:180)
+}
+
+index_subset_7 <- as.vector(unlist(list_subset_7))
+#---------
+
+
+list_subset_8 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_8)){
+  list_subset_8[[i]] <- ((subset_80p_1158_index8[i]-1)*180) + (1:180)
+}
+
+index_subset_8 <- as.vector(unlist(list_subset_8))
+#---------
+
+
+list_subset_9 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_9)){
+  list_subset_9[[i]] <- ((subset_80p_1158_index9[i]-1)*180) + (1:180)
+}
+
+index_subset_9 <- as.vector(unlist(list_subset_9))
+#---------
+
+list_subset_10 <- vector(mode="list",length=927)
+
+for(i in 1:length(list_subset_10)){
+  list_subset_10[[i]] <- ((subset_80p_1158_index10[i]-1)*180) + (1:180)
+}
+
+index_subset_10 <- as.vector(unlist(list_subset_10))
+#---------
+
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1158_stacked")
+
+
+#--------
+
+
+fooofs_927_80p_subset_1 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_1,])))
+
+dim(fooofs_927_80p_subset_1$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_1$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+#1st subset
+
+
+# 
+# time_subset_1_start <- Sys.time()
+# fhmm_8state_80p_subset_1 <-  set_fhmm(fooofs_927_80p_subset_1,nStates = 8,bT=bt)
+# 
+# fit_fhmm_8state_80p_subset_1 <- fitBM_fhmm(fhmm_8state_80p_subset_1) # NEEDS MORE THAN 1 OB PER PERSON
+# summary(fit_fhmm_8state_80p_subset_1)
+# 
+# estimated_fhmm_states_80p_subset_1 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_1)
+# 
+# #psych::describe(estimated_fhmm_states_8)
+# 
+# time_subset_1_end <- Sys.time()
+# 
+# time_subset_1_run <- time_subset_1_end - time_subset_1_start
+# 
+#save(fit_fhmm_8state_80p_subset_1,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_1")
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_1")
+
+estimated_fhmm_states_80p_subset_1 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_1)
+
+#----------
+
+#2nd subset
+
+
+
+fooofs_927_80p_subset_2 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_2,])))
+
+dim(fooofs_927_80p_subset_2$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_2$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_2_start <- Sys.time()
+fhmm_8state_80p_subset_2 <-  set_fhmm(fooofs_927_80p_subset_2,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_2 <- fitBM_fhmm(fhmm_8state_80p_subset_2) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_2)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_2_end <- Sys.time()
+
+time_subset_2_run <- time_subset_2_end - time_subset_2_start
+
+#save(fit_fhmm_8state_80p_subset_2,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_2")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_2")
+
+estimated_fhmm_states_80p_subset_2 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_2)
+
+#----------
+
+#3rd subset
+
+
+
+fooofs_927_80p_subset_3 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_3,])))
+
+dim(fooofs_927_80p_subset_3$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_3$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_3_start <- Sys.time()
+fhmm_8state_80p_subset_3 <-  set_fhmm(fooofs_927_80p_subset_3,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_3 <- fitBM_fhmm(fhmm_8state_80p_subset_3) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_3)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_3_end <- Sys.time()
+
+time_subset_3_run <- time_subset_3_end - time_subset_3_start
+
+#save(fit_fhmm_8state_80p_subset_3,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_3")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_3")
+
+estimated_fhmm_states_80p_subset_3 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_3)
+
+#----------
+
+#4th subset
+
+
+
+fooofs_927_80p_subset_4 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_4,])))
+
+dim(fooofs_927_80p_subset_4$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_4$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_4_start <- Sys.time()
+fhmm_8state_80p_subset_4 <-  set_fhmm(fooofs_927_80p_subset_4,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_4 <- fitBM_fhmm(fhmm_8state_80p_subset_4) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_4)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_4_end <- Sys.time()
+
+time_subset_4_run <- time_subset_4_end - time_subset_4_start
+
+#save(fit_fhmm_8state_80p_subset_4,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_4")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_4")
+
+estimated_fhmm_states_80p_subset_4 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_4)
+
+
+#----------
+#5th subset
+
+
+
+fooofs_927_80p_subset_5 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_5,])))
+
+dim(fooofs_927_80p_subset_5$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_5$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_5_start <- Sys.time()
+fhmm_8state_80p_subset_5 <-  set_fhmm(fooofs_927_80p_subset_5,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_5 <- fitBM_fhmm(fhmm_8state_80p_subset_5) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_5)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_5_end <- Sys.time()
+
+time_subset_5_run <- time_subset_5_end - time_subset_5_start
+
+#save(fit_fhmm_8state_80p_subset_5,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_5")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_5")
+
+estimated_fhmm_states_80p_subset_5 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_5)
+
+
+#----------
+#6th subset
+
+
+
+fooofs_927_80p_subset_6 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_6,])))
+
+dim(fooofs_927_80p_subset_6$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_6$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_6_start <- Sys.time()
+fhmm_8state_80p_subset_6 <-  set_fhmm(fooofs_927_80p_subset_6,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_6 <- fitBM_fhmm(fhmm_8state_80p_subset_6) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_6)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_6_end <- Sys.time()
+
+time_subset_6_run <- time_subset_6_end - time_subset_6_start
+
+#save(fit_fhmm_8state_80p_subset_6,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_6")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_6")
+
+estimated_fhmm_states_80p_subset_6 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_6)
+
+
+
+#----------
+#7th subset
+
+
+
+fooofs_927_80p_subset_7 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_7,])))
+
+dim(fooofs_927_80p_subset_7$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_7$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_7_start <- Sys.time()
+fhmm_8state_80p_subset_7 <-  set_fhmm(fooofs_927_80p_subset_7,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_7 <- fitBM_fhmm(fhmm_8state_80p_subset_7) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_7)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_7_end <- Sys.time()
+
+time_subset_7_run <- time_subset_7_end - time_subset_7_start
+
+#save(fit_fhmm_8state_80p_subset_7,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_7")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_7")
+
+estimated_fhmm_states_80p_subset_7 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_7)
+
+
+
+#----------
+#8th subset
+
+
+
+fooofs_927_80p_subset_8 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_8,])))
+
+dim(fooofs_927_80p_subset_8$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_8$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_8_start <- Sys.time()
+fhmm_8state_80p_subset_8 <-  set_fhmm(fooofs_927_80p_subset_8,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_8 <- fitBM_fhmm(fhmm_8state_80p_subset_8) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_8)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_8_end <- Sys.time()
+
+time_subset_8_run <- time_subset_8_end - time_subset_8_start
+
+#save(fit_fhmm_8state_80p_subset_8,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_8")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_8")
+
+estimated_fhmm_states_80p_subset_8 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_8)
+
+
+
+#----------
+#9th subset
+
+
+
+fooofs_927_80p_subset_9 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_9,])))
+
+dim(fooofs_927_80p_subset_9$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_9$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_9_start <- Sys.time()
+fhmm_8state_80p_subset_9 <-  set_fhmm(fooofs_927_80p_subset_9,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_9 <- fitBM_fhmm(fhmm_8state_80p_subset_9) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_9)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_9_end <- Sys.time()
+
+time_subset_9_run <- time_subset_9_end - time_subset_9_start
+
+#save(fit_fhmm_8state_80p_subset_9,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_9")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_9")
+
+estimated_fhmm_states_80p_subset_9 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_9)
+
+
+
+#----------
+#10th subset
+
+
+
+fooofs_927_80p_subset_10 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[index_subset_10,])))
+
+dim(fooofs_927_80p_subset_10$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_927_80p_subset_10$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+time_subset_10_start <- Sys.time()
+fhmm_8state_80p_subset_10 <-  set_fhmm(fooofs_927_80p_subset_10,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_10 <- fitBM_fhmm(fhmm_8state_80p_subset_10) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_10)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_10_end <- Sys.time()
+
+time_subset_10_run <- time_subset_10_end - time_subset_10_start
+
+#save(fit_fhmm_8state_80p_subset_10,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_10")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_10")
+
+estimated_fhmm_states_80p_subset_10 <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_10)
+
+
+
+#--------------
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_1")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_2")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_3")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_4")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_5")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_6")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_7")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_8")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_9")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_10")
+
+
+```
+
+# inspecting results from 80% subset models...    
+```{r}
+
+
+gg_fhmm_8_centroids_subset_1 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][1,]),colour="green")+
+  ylim(0,1.1)
+
+ 
+
+gg_fhmm_8_centroids_subset_2 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][7,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][5,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][4,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][1,]),colour="purple") +
+  ylim(0,1.1)
+
+
+
+gg_fhmm_8_centroids_subset_3 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][3,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][1,]),colour="purple") +
+  ylim(0,1.1)
+
+
+gg_fhmm_8_centroids_subset_4 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][7,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][6,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][1,]),colour="purple") +
+  ylim(0,1.1)
+
+
+gg_fhmm_8_centroids_subset_5 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][4,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][1,]),colour="purple") +
+  ylim(0,1.1)
+
+gg_fhmm_8_centroids_subset_6 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][5,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][4,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1)# High delta
+
+
+
+
+gg_fhmm_8_centroids_subset_7 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][7,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][4,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][3,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_subset_7
+#------
+
+
+gg_fhmm_8_centroids_subset_8 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][1,]),colour="grey")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_subset_8
+#------
+
+gg_fhmm_8_centroids_subset_9 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][7,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][5,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][2,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_subset_9
+#------
+
+gg_fhmm_8_centroids_subset_10 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][8,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_subset_10
+#------
+
+# Changed order to put similar together 
+
+ gg_fhmm_8_centroids_subset_1
+ #hist(estimated_fhmm_states_80p_subset_1)
+
+gg_fhmm_8_centroids_subset_6
+ #hist(estimated_fhmm_states_80p_subset_2)
+ 
+ 
+gg_fhmm_8_centroids_subset_2
+ #hist(estimated_fhmm_states_80p_subset_3)
+ 
+ 
+gg_fhmm_8_centroids_subset_4
+ #hist(estimated_fhmm_states_80p_subset_4)
+ 
+ 
+gg_fhmm_8_centroids_subset_3
+ #hist(estimated_fhmm_states_80p_subset_5)
+ 
+ 
+gg_fhmm_8_centroids_subset_5
+ #hist(estimated_fhmm_states_80p_subset_6)
+ 
+#gg_fhmm_8_centroids_subset_all
+
+gg_fhmm_8_centroids_subset_7
+gg_fhmm_8_centroids_subset_8
+gg_fhmm_8_centroids_subset_9
+gg_fhmm_8_centroids_subset_10
+
+
+#------ try plotting them all together
+
+gg_fhmm_8_centroids_subset_all <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][1,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][7,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][5,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][4,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][1,]),colour="purple") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][3,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][1,]),colour="purple") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][7,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][6,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_4$centroids$data[[1]][1,]),colour="purple") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][4,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_5$centroids$data[[1]][1,]),colour="purple") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][5,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][4,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_6$centroids$data[[1]][1,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][7,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][4,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][3,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][2,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_7$centroids$data[[1]][1,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][7,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_8$centroids$data[[1]][1,]),colour="grey")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][8,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][7,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][5,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][2,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_9$centroids$data[[1]][1,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][8,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][5,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_10$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1)
+
+gg_fhmm_8_centroids_subset_all
+ 
+```
+
+
+# Looking at the 80% subsets:
+
+- 4 most consistent = very high power alpha (red), high freq med power alpha (green), low freq med power alpha (blue), low alpha/high delta. The two med power alphas split into high/low power sub-states in some of the views.
+
+
+
+
+#----------------------
+
+
+# TESTING REMOVING EVERY 2ND PSD FOR LESS AUTOCORRELATION
+
+# It doesn't seem to make any difference - each individual typically still only occupies one state
+
+```{r}
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1158_stacked")
+
+#----- generate odd indices for 208440
+
+odd_indices_208440 <- seq(1,208440,by=2)
+
+
+fooofs_odd_subset <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[odd_indices_208440,])))
+
+dim(fooofs_odd_subset$data[[1]])[1]
+
+n <- 18 # length of each Eyes closed segment - half of 36 for odd/less autocorr subset
+n_tot <- dim(fooofs_odd_subset$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+#1st subset
+
+
+
+time_subset_odd_start <- Sys.time()
+fhmm_8state_80p_subset_odd <-  set_fhmm(fooofs_odd_subset,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_subset_odd <- fitBM_fhmm(fhmm_8state_80p_subset_odd) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_subset_odd)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_odd_end <- Sys.time()
+
+time_subset_odd_run <- time_subset_odd_end - time_subset_odd_start
+
+#save(fit_fhmm_8state_80p_subset_odd,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_odd")
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_subset_odd")
+
+estimated_fhmm_states_80p_subset_odd <- hmmhdd::viterbi(fit_fhmm_8state_80p_subset_odd)
+
+
+gg_fhmm_8_centroids_subset_odd <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][7,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][6,]),colour="yellow")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][5,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][4,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][2,]),colour="brown")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_odd$centroids$data[[1]][1,]),colour="grey")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_subset_odd
+hist(estimated_fhmm_states_80p_subset_odd)
+
+estimated_fhmm_states_80p_subset_odd
+
+
+```
+
+
+
+# exploratory analysis of N. states occupied per person
+
+```{r}
+estimated_fhmm_states_5
+matrix_states_5_test <- matrix(estimated_fhmm_states_5,nrow=1158,ncol=180,byrow=T)
+
+n_unique_pp <- apply(matrix_states_5_test,1,function(x) length(unique(x)))
+
+n_unique_pp
+
+hist(n_unique_pp)
+
+
+pp_in_1 <- apply(matrix_states_5_test, 1, function(x) any(x %in% 1))
+pp_in_2 <- apply(matrix_states_5_test, 1, function(x) any(x %in% 2))
+pp_in_3 <- apply(matrix_states_5_test, 1, function(x) any(x %in% 3))
+pp_in_4 <- apply(matrix_states_5_test, 1, function(x) any(x %in% 4))
+pp_in_5 <- apply(matrix_states_5_test, 1, function(x) any(x %in% 5))
+
+
+sum(pp_in_1) #21
+sum(pp_in_2) #208
+sum(pp_in_3) #652
+sum(pp_in_4) #239
+sum(pp_in_5) #672
+
+
+#------
+
+#also consider N. states occupied... (n_unique_pp)
+
+
+
+# Also try counting N. of transitions per person from viterbi
+
+# Could also look at follow up analysis based on state probabilities
+
+
+
+```
+
+
+# Testing initialising 6-state model with 6 states from 80% subsets
+
+```{r}
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][8,]),colour="purple")+
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][6,]),colour="red")+
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][5,]),colour="grey")+
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_2$centroids$data[[1]][4,]),colour="yellow")+
+  # eom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][3,]),colour="brown")+
+  # geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_3$centroids$data[[1]][2,]),colour="orange")+
+
+# Select 6 centroids (very low alpha, very high alpha, low power low freq alpha, high power low freq alpha, low power high freq alpha, high power high freq alpha)
+
+initial_6_centroids_test <- rbind(fit_fhmm_8state_80p_subset_2$centroids$data[[1]][8,],fit_fhmm_8state_80p_subset_2$centroids$data[[1]][6,],fit_fhmm_8state_80p_subset_2$centroids$data[[1]][5,],fit_fhmm_8state_80p_subset_2$centroids$data[[1]][4,],fit_fhmm_8state_80p_subset_3$centroids$data[[1]][3,],fit_fhmm_8state_80p_subset_3$centroids$data[[1]][2,])
+
+plot(initial_6_centroids_test[1,],type='l')
+plot(initial_6_centroids_test[2,],type='l')
+plot(initial_6_centroids_test[3,],type='l')
+plot(initial_6_centroids_test[4,],type='l')
+plot(initial_6_centroids_test[5,],type='l')
+plot(initial_6_centroids_test[6,],type='l')
+
+
+
+# Save selected 6 centroids in expected format for FHMM
+initial_6_centroids_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(initial_6_centroids_test)))
+
+
+#--------------
+
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1158_stacked")
+
+#!!!!!!---------------!!!!!!!!!!
+
+
+
+fooofs_1158_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked)))
+
+#!!!!!!---------------!!!!!!!!!!
+
+dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+
+bt <- seq(1,n_tot,by=n)
+
+
+
+#-------------
+# LEARNT THE LESSON - RESET BT!!!!
+
+
+
+
+
+time_6_init_select_start <- Sys.time()
+
+fhmm_selected_6_initial <- set_fhmm(fooofs_1158_for_fhmm,nStates = 6,bT=bt, centroids = initial_6_centroids_for_fhmm)
+
+fit_fhmm_selected_6_initial <- fitBM_fhmm(fhmm_selected_6_initial) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_selected_6_initial)
+
+
+
+
+
+time_6_init_select_end <- Sys.time()
+
+time_6_init_select_run <- time_6_init_select_end - time_6_init_select_start
+
+#save(fit_fhmm_selected_6_initial,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_6_selected_centroids_initialised_1158")
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_6_selected_centroids_initialised_1158")
+
+
+estimated_fhmm_states_6_init_test <- hmmhdd::viterbi(fit_fhmm_selected_6_initial) 
+
+#--------------
+
+
+
+gg_fhmm_selected_6_initial<- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][6,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][3,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_selected_6_initial
+hist(estimated_fhmm_states_6_init_test)
+
+estimated_fhmm_states_6_init_test
+
+```
+
+
+
+# Testing initialising 4-state model with 4 states from 80% subsets
+
+```{r}
+
+
+gg_4_initial_centroids <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][3,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_subset_1$centroids$data[[1]][1,]),colour="green")+
+  ylim(0,1.1) + ggtitle("4 Initial Centroids")
+
+# Select 4 centroids (very low alpha, very high alpha, med power low freq alpha, med power high freq alpha)
+
+initial_4_centroids_test <- rbind(fit_fhmm_8state_80p_subset_1$centroids$data[[1]][5,],fit_fhmm_8state_80p_subset_1$centroids$data[[1]][4,],fit_fhmm_8state_80p_subset_1$centroids$data[[1]][3,],fit_fhmm_8state_80p_subset_1$centroids$data[[1]][1,])
+
+plot(initial_4_centroids_test[1,],type='l')
+plot(initial_4_centroids_test[2,],type='l')
+plot(initial_4_centroids_test[3,],type='l')
+plot(initial_4_centroids_test[4,],type='l')
+
+
+# Save selected 4 centroids in expected format for FHMM
+initial_4_centroids_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(initial_4_centroids_test)))
+
+
+#--------------
+
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1158_stacked")
+
+#!!!!!!---------------!!!!!!!!!!
+
+
+
+fooofs_1158_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked)))
+
+#!!!!!!---------------!!!!!!!!!!
+
+dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+
+bt <- seq(1,n_tot,by=n)
+
+
+
+#-------------
+# LEARNT THE LESSON - RESET BT!!!!
+
+
+
+
+
+time_4_init_select_start <- Sys.time()
+
+fhmm_selected_4_initial <- set_fhmm(fooofs_1158_for_fhmm,nStates = 4,bT=bt, centroids = initial_4_centroids_for_fhmm)
+
+fit_fhmm_selected_4_initial <- fitBM_fhmm(fhmm_selected_4_initial) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_selected_4_initial)
+
+
+estimated_fhmm_states_4_init_test <- hmmhdd::viterbi(fit_fhmm_selected_4_initial) # problem with this???
+
+
+
+time_4_init_select_end <- Sys.time()
+
+time_4_init_select_run <- time_4_init_select_end - time_4_init_select_start
+
+save(fit_fhmm_selected_4_initial,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_4_selected_centroids_initialised_1158")
+
+#load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_4_selected_centroids_initialised_1158")
+
+
+
+
+#--------------
+
+
+
+gg_fhmm_selected_4_initial<- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial$centroids$data[[1]][3,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1) + ggtitle ("Final centroids from initialised 4-state model")
+
+gg_fhmm_selected_4_initial
+hist(estimated_fhmm_states_4_init_test)
+
+estimated_fhmm_states_4_init_test
+gg_4_initial_centroids
+gg_fhmm_selected_4_initial
+
+
+
+```
+
+
+
+
+
+# FHMM 4-states, using initialised 6-state model outputs (4 real states) as initials
+
+```{r}
+
+#4 CENTROIDS FROM 6-STATE INITIALISED MODEL
+gg_4_initial_centroids_final <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][4,]),colour="purple")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][3,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_6_initial$centroids$data[[1]][2,]),colour="red")+
+  ylim(0,1.1) + ggtitle("4 Initial Centroids for FINAL model")
+gg_4_initial_centroids_final
+
+# Select 4 centroids (very low alpha, very high alpha, med power low freq alpha, med power high freq alpha)
+
+initial_4_centroids_test_final <- rbind(fit_fhmm_selected_6_initial$centroids$data[[1]][5,],fit_fhmm_selected_6_initial$centroids$data[[1]][4,],fit_fhmm_selected_6_initial$centroids$data[[1]][3,],fit_fhmm_selected_6_initial$centroids$data[[1]][2,])
+
+plot(initial_4_centroids_test_final[1,],type='l')
+plot(initial_4_centroids_test_final[2,],type='l')
+plot(initial_4_centroids_test_final[3,],type='l')
+plot(initial_4_centroids_test_final[4,],type='l')
+
+
+# Save selected 4 centroids in expected format for FHMM
+initial_4_centroids_for_fhmm_final <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(initial_4_centroids_test_final)))
+
+
+#--------------
+
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1158_stacked")
+
+#!!!!!!---------------!!!!!!!!!!
+
+
+
+fooofs_1158_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked)))
+
+#!!!!!!---------------!!!!!!!!!!
+
+dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_1158_for_fhmm$data[[1]])[1]
+
+
+bt <- seq(1,n_tot,by=n)
+
+
+
+#-------------
+# LEARNT THE LESSON - RESET BT!!!!
+
+
+
+
+
+time_4_init_select_start_final <- Sys.time()
+
+fhmm_selected_4_initial_final <- set_fhmm(fooofs_1158_for_fhmm,nStates = 4,bT=bt, centroids = initial_4_centroids_for_fhmm_final)
+
+fit_fhmm_selected_4_initial_final <- fitBM_fhmm(fhmm_selected_4_initial_final) 
+summary(fit_fhmm_selected_4_initial_final)
+
+
+estimated_fhmm_states_4_init_final <- hmmhdd::viterbi(fit_fhmm_selected_4_initial_final) 
+
+
+
+time_4_init_select_end_final <- Sys.time()
+
+time_4_init_select_run_final <- time_4_init_select_end_final - time_4_init_select_start_final
+
+save(fit_fhmm_selected_4_initial_final,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fit_fhmm_selected_4_initial_final")
+
+#load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fit_fhmm_selected_4_initial_final")
+
+
+
+
+#--------------
+
+
+
+gg_fhmm_selected_4_initial_final<- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial_final$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial_final$centroids$data[[1]][3,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial_final$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_selected_4_initial_final$centroids$data[[1]][1,]),colour="purple")+
+  ylim(0,1.1) + ggtitle ("Final centroids from initialised 4-state FINAL model")
+
+gg_fhmm_selected_4_initial_final
+hist(estimated_fhmm_states_4_init_final)
+
+estimated_fhmm_states_4_init_final
+gg_4_initial_centroids_final
+gg_fhmm_selected_4_initial_final
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 17/02/2023 170223
+
+# Running FHMM with only early adolescents (ages 9-15) included
+
+# Will probably have to set up 10 x 80% subset models to run again, to initialise appropriate centroids for this age group. Hopefully each model takes half as long... (initially made an error with subsetting the fooof_1158_stacked object by the 503 indices out of 1158, rather than selecting the 180second snippets for each of 503 individuals - thought it was weird that models were running instantly. It was.)
+
+```{r}
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_6_selected_centroids_initialised_1158") #for 4 centroids
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_1158_stacked")
+load("index_1158_ages_915")
+
+#--------
+
+# Full list index for subset of 9-15 year olds
+
+list_index_ages915 <- vector(mode="list",length=length(index_1158_ages_915)) #503 individuals
+
+for(i in 1:length(list_index_ages915)){
+  list_index_ages915[[i]] <- ((index_1158_ages_915[i]-1)*180) + (1:180)
+}
+
+list_index_ages915 <- as.vector(unlist(list_index_ages915))
+
+#-------------
+
+fooof_ages915_stacked <- fooof_1158_stacked[list_index_ages915,]
+fooof_ages915_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_1158_stacked[list_index_ages915,])))
+
+save(fooof_ages915_stacked,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_ages915_stacked")
+
+
+
+#---------
+
+
+dim(fooof_ages915_for_fhmm$data[[1]])[1] #503 X 180 = 90540; 503 early adolescent participants in age range 9-15
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooof_ages915_for_fhmm$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#-------------------
+# 
+# # 6 state model for ages 9-15
+# 
+# time_start_A <- Sys.time()
+# fhmm_6state_ages915 <-  set_fhmm(fooof_ages915_for_fhmm,nStates = 6,bT=bt)
+# 
+# fit_fhmm_6state_ages915 <- fitBM_fhmm(fhmm_6state_ages915)
+# summary(fit_fhmm_6state_ages915)
+# 
+# 
+# #psych::describe(estimated_fhmm_states_8)
+# 
+# time_end_A <- Sys.time()
+# 
+# time_run_A <- time_end_A - time_start_A
+# 
+# save(fit_fhmm_6state_ages915,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_6state_ages915")
+# 
+# estimated_fhmm_states_6state_ages915 <- hmmhdd::viterbi(fit_fhmm_6state_ages915)
+# 
+# hist(estimated_fhmm_states_6state_ages915)
+# 
+# #-------------------
+# 
+# # 5 state model for ages 9-15
+# 
+# time_start_B <- Sys.time()
+# fhmm_5state_ages915 <-  set_fhmm(fooof_ages915_for_fhmm,nStates = 5,bT=bt)
+# 
+# fit_fhmm_5state_ages915 <- fitBM_fhmm(fhmm_5state_ages915)
+# summary(fit_fhmm_5state_ages915)
+# 
+# plot(fit_fhmm_5state_ages915)
+# 
+# 
+# #psych::describe(estimated_fhmm_states_8)
+# 
+# time_end_B <- Sys.time()
+# 
+# time_run_B <- time_end_B - time_start_B
+# 
+# save(fit_fhmm_5state_ages915,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_5state_ages915")
+# 
+# estimated_fhmm_states_5state_ages915 <- hmmhdd::viterbi(fit_fhmm_5state_ages915)
+# 
+# 
+# hist(estimated_fhmm_states_5state_ages915)
+# #-------------------
+# 
+# # 4 state model for ages 9-15
+# 
+# time_start_C <- Sys.time()
+# fhmm_4state_ages915 <-  set_fhmm(fooof_ages915_for_fhmm,nStates = 4,bT=bt)
+# 
+# fit_fhmm_4state_ages915 <- fitBM_fhmm(fhmm_4state_ages915)
+# summary(fit_fhmm_4state_ages915)
+# 
+# 
+# #psych::describe(estimated_fhmm_states_8)
+# 
+# time_end_C <- Sys.time()
+# 
+# time_run_C <- time_end_C - time_start_C
+# 
+# save(fit_fhmm_4state_ages915,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_4state_ages915")
+# 
+# estimated_fhmm_states_4state_ages915 <- hmmhdd::viterbi(fit_fhmm_4state_ages915)
+# 
+# hist(estimated_fhmm_states_4state_ages915)
+
+#-------------------
+
+# 4 state model for ages 9-15 - INITIALISED by centroids from model with 5 states...
+
+initial_4_centroids_test_final <- rbind(fit_fhmm_selected_6_initial$centroids$data[[1]][5,],fit_fhmm_selected_6_initial$centroids$data[[1]][4,],fit_fhmm_selected_6_initial$centroids$data[[1]][3,],fit_fhmm_selected_6_initial$centroids$data[[1]][2,])
+
+# Save selected 4 centroids in expected format for FHMM
+initial_4_centroids_for_fhmm_final <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(initial_4_centroids_test_final)))
+
+time_start_D <- Sys.time()
+fhmm_4state_ages915_initialised <-  set_fhmm(fooof_ages915_for_fhmm,nStates = 4,bT=bt,centroids = initial_4_centroids_for_fhmm_final)
+
+fit_fhmm_4state_ages915_initialised <- fitBM_fhmm(fhmm_4state_ages915_initialised)
+summary(fit_fhmm_4state_ages915_initialised)
+
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_end_D <- Sys.time()
+
+time_run_D <- time_end_D - time_start_D
+
+#save(fit_fhmm_4state_ages915_initialised,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_4state_ages915_initialised")
+
+estimated_fhmm_states_4state_ages915_initialised <- hmmhdd::viterbi(fit_fhmm_4state_ages915_initialised)
+
+hist(estimated_fhmm_states_4state_ages915_initialised)
+
+
+
+
+```
+
+
+
+# Running 80% SUBSET models for ages 9-15 to find stable centroids to initialise...
+
+```{r}
+# 
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_ages915_stacked")
+# 
+# # Define indices for random subsets
+# # 80% of 503 = 402
+# 
+# set.seed(122)
+# 
+# subset_80p_ages915_index1 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index2 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index3 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index4 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index5 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index6 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index7 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index8 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index9 <- sort(sample.int(503,402,replace=F))
+# subset_80p_ages915_index10 <- sort(sample.int(503,402,replace=F))
+# 
+# 
+# 
+# save(subset_80p_ages915_index1,file="subset_80p_ages915_index1")
+# save(subset_80p_ages915_index2,file="subset_80p_ages915_index2")
+# save(subset_80p_ages915_index3,file="subset_80p_ages915_index3")
+# save(subset_80p_ages915_index4,file="subset_80p_ages915_index4")
+# save(subset_80p_ages915_index5,file="subset_80p_ages915_index5")
+# save(subset_80p_ages915_index6,file="subset_80p_ages915_index6")
+# save(subset_80p_ages915_index7,file="subset_80p_ages915_index7")
+# save(subset_80p_ages915_index8,file="subset_80p_ages915_index8")
+# save(subset_80p_ages915_index9,file="subset_80p_ages915_index9")
+# save(subset_80p_ages915_index10,file="subset_80p_ages915_index10")
+
+
+
+
+
+
+load("subset_80p_ages915_index1")
+load("subset_80p_ages915_index2")
+load("subset_80p_ages915_index3")
+load("subset_80p_ages915_index4")
+load("subset_80p_ages915_index5")
+load("subset_80p_ages915_index6")
+load("subset_80p_ages915_index7")
+load("subset_80p_ages915_index8")
+load("subset_80p_ages915_index9")
+load("subset_80p_ages915_index10")
+
+#-----------
+
+list_subset_1 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_1)){
+  list_subset_1[[i]] <- ((subset_80p_ages915_index1[i]-1)*180) + (1:180)
+}
+
+index_subset_1 <- as.vector(unlist(list_subset_1))
+
+#-----------
+
+list_subset_2 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_2)){
+  list_subset_2[[i]] <- ((subset_80p_ages915_index2[i]-1)*180) + (1:180)
+}
+
+index_subset_2 <- as.vector(unlist(list_subset_2))
+
+#-----------
+
+list_subset_3 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_3)){
+  list_subset_3[[i]] <- ((subset_80p_ages915_index3[i]-1)*180) + (1:180)
+}
+
+index_subset_3 <- as.vector(unlist(list_subset_3))
+
+#-----------
+
+list_subset_4 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_4)){
+  list_subset_4[[i]] <- ((subset_80p_ages915_index4[i]-1)*180) + (1:180)
+}
+
+index_subset_4 <- as.vector(unlist(list_subset_4))
+
+#-----------
+
+list_subset_5 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_5)){
+  list_subset_5[[i]] <- ((subset_80p_ages915_index5[i]-1)*180) + (1:180)
+}
+
+index_subset_5 <- as.vector(unlist(list_subset_5))
+
+#-----------
+
+list_subset_6 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_6)){
+  list_subset_6[[i]] <- ((subset_80p_ages915_index6[i]-1)*180) + (1:180)
+}
+
+index_subset_6 <- as.vector(unlist(list_subset_6))
+#---------
+
+
+list_subset_7 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_7)){
+  list_subset_7[[i]] <- ((subset_80p_ages915_index7[i]-1)*180) + (1:180)
+}
+
+index_subset_7 <- as.vector(unlist(list_subset_7))
+#---------
+
+
+list_subset_8 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_8)){
+  list_subset_8[[i]] <- ((subset_80p_ages915_index8[i]-1)*180) + (1:180)
+}
+
+index_subset_8 <- as.vector(unlist(list_subset_8))
+#---------
+
+
+list_subset_9 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_9)){
+  list_subset_9[[i]] <- ((subset_80p_ages915_index9[i]-1)*180) + (1:180)
+}
+
+index_subset_9 <- as.vector(unlist(list_subset_9))
+#---------
+
+list_subset_10 <- vector(mode="list",length=402)
+
+for(i in 1:length(list_subset_10)){
+  list_subset_10[[i]] <- ((subset_80p_ages915_index10[i]-1)*180) + (1:180)
+}
+
+index_subset_10 <- as.vector(unlist(list_subset_10))
+#---------
+
+
+
+
+#--------
+#1st subset
+
+
+fooofs_402_80p_subset_1 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_1,])))
+
+dim(fooofs_402_80p_subset_1$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_1$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+
+
+time_subset_1_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_1 <-  set_fhmm(fooofs_402_80p_subset_1,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_1 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_1) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_1)
+
+estimated_fhmm_states_80p_ages915_subset_1 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_1)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_1_end <- Sys.time()
+
+time_subset_1_run <- time_subset_1_end - time_subset_1_start
+
+save(fit_fhmm_8state_80p_ages915_subset_1,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_1")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_1")
+
+estimated_fhmm_states_80p_ages915_subset_1 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_1)
+
+#----------
+#2nd subset
+
+fooofs_402_80p_subset_2 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_2,])))
+
+dim(fooofs_402_80p_subset_2$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_2$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+
+
+
+time_subset_2_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_2 <-  set_fhmm(fooofs_402_80p_subset_2,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_2 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_2) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_2)
+
+estimated_fhmm_states_80p_ages915_subset_2 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_2)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_2_end <- Sys.time()
+
+time_subset_2_run <- time_subset_2_end - time_subset_2_start
+
+save(fit_fhmm_8state_80p_ages915_subset_2,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_2")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_2")
+
+estimated_fhmm_states_80p_ages915_subset_2 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_2)
+
+#----------
+
+# 3rd subset
+
+fooofs_402_80p_subset_3 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_3,])))
+
+dim(fooofs_402_80p_subset_3$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_3$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+
+time_subset_3_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_3 <-  set_fhmm(fooofs_402_80p_subset_3,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_3 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_3) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_3)
+
+estimated_fhmm_states_80p_ages915_subset_3 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_3)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_3_end <- Sys.time()
+
+time_subset_3_run <- time_subset_3_end - time_subset_3_start
+
+save(fit_fhmm_8state_80p_ages915_subset_3,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_3")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_3")
+
+estimated_fhmm_states_80p_ages915_subset_3 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_3)
+
+#----------
+
+#4th subset
+
+fooofs_402_80p_subset_4 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_4,])))
+
+dim(fooofs_402_80p_subset_4$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_4$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+
+
+
+time_subset_4_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_4 <-  set_fhmm(fooofs_402_80p_subset_4,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_4 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_4) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_4)
+
+estimated_fhmm_states_80p_ages915_subset_4 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_4)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_4_end <- Sys.time()
+
+time_subset_4_run <- time_subset_4_end - time_subset_4_start
+
+save(fit_fhmm_8state_80p_ages915_subset_4,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_4")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_4")
+
+estimated_fhmm_states_80p_ages915_subset_4 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_4)
+
+#----------
+
+#5th subset
+
+fooofs_402_80p_subset_5 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_5,])))
+
+dim(fooofs_402_80p_subset_5$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_5$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+
+
+time_subset_5_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_5 <-  set_fhmm(fooofs_402_80p_subset_5,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_5 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_5) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_5)
+
+estimated_fhmm_states_80p_ages915_subset_5 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_5)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_5_end <- Sys.time()
+
+time_subset_5_run <- time_subset_5_end - time_subset_5_start
+
+save(fit_fhmm_8state_80p_ages915_subset_5,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_5")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_5")
+
+estimated_fhmm_states_80p_ages915_subset_5 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_5)
+
+#----------
+
+# 6th subset
+
+fooofs_402_80p_subset_6 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_6,])))
+
+dim(fooofs_402_80p_subset_6$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_6$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+time_subset_6_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_6 <-  set_fhmm(fooofs_402_80p_subset_6,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_6 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_6) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_6)
+
+estimated_fhmm_states_80p_ages915_subset_6 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_6)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_6_end <- Sys.time()
+
+tnime_subset_6_run <- time_subset_6_end - time_subset_6_start
+
+save(fit_fhmm_8state_80p_ages915_subset_6,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_6")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_6")
+
+estimated_fhmm_states_80p_ages915_subset_6 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_6)
+
+#----------
+
+# 7th subset
+
+fooofs_402_80p_subset_7 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_7,])))
+
+dim(fooofs_402_80p_subset_7$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_7$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+
+time_subset_7_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_7 <-  set_fhmm(fooofs_402_80p_subset_7,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_7 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_7) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_7)
+
+estimated_fhmm_states_80p_ages915_subset_7 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_7)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_7_end <- Sys.time()
+
+time_subset_7_run <- time_subset_7_end - time_subset_7_start
+
+save(fit_fhmm_8state_80p_ages915_subset_7,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_7")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_7")
+
+estimated_fhmm_states_80p_ages915_subset_7 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_7)
+
+#----------
+
+#8th subset
+
+fooofs_402_80p_subset_8 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_8,])))
+
+dim(fooofs_402_80p_subset_8$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_8$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+time_subset_8_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_8 <-  set_fhmm(fooofs_402_80p_subset_8,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_8 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_8) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_8)
+
+estimated_fhmm_states_80p_ages915_subset_8 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_8)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_8_end <- Sys.time()
+
+time_subset_8_run <- time_subset_8_end - time_subset_8_start
+
+save(fit_fhmm_8state_80p_ages915_subset_8,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_8")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_8")
+
+estimated_fhmm_states_80p_ages915_subset_8 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_8)
+
+#----------
+
+#9th subset
+
+fooofs_402_80p_subset_9 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_9,])))
+
+dim(fooofs_402_80p_subset_9$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_9$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+time_subset_9_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_9 <-  set_fhmm(fooofs_402_80p_subset_9,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_9 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_9) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_9)
+
+estimated_fhmm_states_80p_ages915_subset_9 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_9)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_9_end <- Sys.time()
+
+time_subset_9_run <- time_subset_9_end - time_subset_9_start
+
+save(fit_fhmm_8state_80p_ages915_subset_9,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_9")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_9")
+
+estimated_fhmm_states_80p_ages915_subset_9 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_9)
+
+#----------
+
+#10th subset
+
+fooofs_402_80p_subset_10 <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked[index_subset_10,])))
+
+dim(fooofs_402_80p_subset_10$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooofs_402_80p_subset_10$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+time_subset_10_start <- Sys.time()
+fhmm_8state_80p_ages915_subset_10 <-  set_fhmm(fooofs_402_80p_subset_10,nStates = 8,bT=bt)
+
+fit_fhmm_8state_80p_ages915_subset_10 <- fitBM_fhmm(fhmm_8state_80p_ages915_subset_10) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_8state_80p_ages915_subset_10)
+
+estimated_fhmm_states_80p_ages915_subset_10 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_10)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_subset_10_end <- Sys.time()
+
+time_subset_10_run <- time_subset_10_end - time_subset_10_start
+
+save(fit_fhmm_8state_80p_ages915_subset_10,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_10")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_10")
+
+estimated_fhmm_states_80p_ages915_subset_10 <- hmmhdd::viterbi(fit_fhmm_8state_80p_ages915_subset_10)
+hist(estimated_fhmm_states_80p_ages915_subset_10)
+#----------
+
+
+#--------------
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_1")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_2")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_3")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_4")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_5")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_6")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_7")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_8")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_9")
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_10")
+
+
+```
+
+
+
+
+# inspecting results from 80% subset models...    
+```{r}
+
+
+gg_fhmm_8_centroids_ages915_subset_1 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][6,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][4,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][1,]),colour="black")+
+  ylim(0,1.1)
+
+gg_fhmm_8_centroids_ages915_subset_1
+
+
+
+ 
+
+gg_fhmm_8_centroids_ages915_subset_2 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][7,]),colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][1,]),colour="red") +
+  ylim(0,1.1)
+
+gg_fhmm_8_centroids_ages915_subset_2
+
+
+
+
+gg_fhmm_8_centroids_ages915_subset_3 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][8,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][6,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][5,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][1,]),colour="red") +
+  ylim(0,1.1)
+
+gg_fhmm_8_centroids_ages915_subset_3
+
+
+
+
+gg_fhmm_8_centroids_ages915_subset_4 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][6,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][4,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][1,]),colour="red") +
+  ylim(0,1.1)
+
+gg_fhmm_8_centroids_ages915_subset_4
+
+
+
+gg_fhmm_8_centroids_ages915_subset_5 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][8,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][6,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][1,]),colour="red") +
+  ylim(0,1.1)
+
+gg_fhmm_8_centroids_ages915_subset_5
+
+
+
+gg_fhmm_8_centroids_ages915_subset_6 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][8,]),colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][6,]),colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][1,]),colour="green")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_ages915_subset_6
+
+
+
+gg_fhmm_8_centroids_ages915_subset_7 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][7,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][6,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][2,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][1,]),colour="red")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_ages915_subset_7
+#------
+
+
+
+
+gg_fhmm_8_centroids_ages915_subset_8 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][3,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][2,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][1,]),colour="green")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_ages915_subset_8
+#------
+
+
+
+
+
+gg_fhmm_8_centroids_ages915_subset_9 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][4,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][1,]),colour="blue")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_ages915_subset_9
+#------
+
+
+
+gg_fhmm_8_centroids_ages915_subset_10 <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][8,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][5,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][3,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][1,]),colour="blue")+
+  ylim(0,1.1)# High delta
+
+gg_fhmm_8_centroids_ages915_subset_10
+#------
+
+
+
+# Changed order to put similar together 
+
+ gg_fhmm_8_centroids_ages915_subset_1
+ #hist(estimated_fhmm_states_80p_ages915_subset_1)
+
+gg_fhmm_8_centroids_ages915_subset_2
+ #hist(estimated_fhmm_states_80p_ages915_subset_2)
+ 
+ 
+gg_fhmm_8_centroids_ages915_subset_3
+ #hist(estimated_fhmm_states_80p_ages915_subset_3)
+ 
+ 
+gg_fhmm_8_centroids_ages915_subset_4
+ #hist(estimated_fhmm_states_80p_ages915_subset_4)
+ 
+ 
+gg_fhmm_8_centroids_ages915_subset_5
+ #hist(estimated_fhmm_states_80p_ages915_subset_5)
+ 
+ 
+gg_fhmm_8_centroids_ages915_subset_6
+ #hist(estimated_fhmm_states_80p_ages915_subset_6)
+ 
+
+
+gg_fhmm_8_centroids_ages915_subset_7
+gg_fhmm_8_centroids_ages915_subset_8
+gg_fhmm_8_centroids_ages915_subset_9
+gg_fhmm_8_centroids_ages915_subset_10
+
+gg_fhmm_8_centroids_subset_all
+
+
+#------ try plotting them all together
+
+gg_fhmm_8_centroids_subset_all <- ggplot()+
+    geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][6,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][4,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][1,]),colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][7,]),colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][2,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][1,]),colour="red") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][8,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][6,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][5,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][1,]),colour="red") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][6,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][4,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][1,]),colour="red") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][8,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][6,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][2,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][1,]),colour="red") +
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][8,]),colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][6,]),colour="black")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][1,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][7,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][6,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][2,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][1,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][5,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][3,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][2,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][1,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][8,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][7,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][5,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][4,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][3,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][1,]),colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][8,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][7,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][6,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][5,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][4,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][3,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][2,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][1,]),colour="blue")+
+  ylim(0,1.1)# High delta
+
+
+gg_fhmm_8_centroids_subset_all
+
+```
+
+# Generate figures for centroids from subset models
+```{r}
+
+png("subset_centroids_separate.png",width=3000,height=5000,pointsize=20)
+   gridExtra::grid.arrange(nrow = 5, ncol = 2, 
+gg_fhmm_8_centroids_ages915_subset_1,
+gg_fhmm_8_centroids_ages915_subset_2,
+gg_fhmm_8_centroids_ages915_subset_3,
+gg_fhmm_8_centroids_ages915_subset_4,
+gg_fhmm_8_centroids_ages915_subset_5,
+gg_fhmm_8_centroids_ages915_subset_6,
+gg_fhmm_8_centroids_ages915_subset_7,
+gg_fhmm_8_centroids_ages915_subset_8,
+gg_fhmm_8_centroids_ages915_subset_9,
+gg_fhmm_8_centroids_ages915_subset_10)
+dev.off()
+
+
+png("subset_centroids_all.png",width=1000,height=500,pointsize=20)
+gg_fhmm_8_centroids_subset_all
+dev.off()
+
+```
+
+# Generating centroids to initialise 9-15 model...
+
+# OK to use heuristic approach - they collapse because of bad initial values
+
+```{r}
+
+
+#--------------
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_1")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_2")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_3")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_4")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_5")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_6")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_7")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_8")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_9")
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fhmm_80p_ages915_subset_10")
+
+red_centroids <- rbind(fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][8,],
+                       fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][7,],
+                       fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][2,],
+                       fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][8,],
+                       fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][6,],
+                       fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][5,],
+                       fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][4,],
+                       fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][1,],
+                       fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][7,],
+                       fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][4,],
+                       fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][2,],
+                       fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][1,],
+                       fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][8,],
+                       fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][5,],
+                       fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][2,],
+                       fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][1,],
+                       fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][7,],
+                       fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][5,],
+                       fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][4,],
+                       fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][1,],
+                       fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][7,],
+                       fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][4,],
+                       fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][2,],
+                       fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][8,],
+                       fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][5,],
+                       fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][4,],
+                       fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][1,],
+                       fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][8,],
+                       fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][7,],
+                       fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][6,],
+                       fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][4,],
+                       fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][8,],
+                       fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][6,],
+                       fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][5,],
+                       fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][3,],
+                       fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][2,],
+                       fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][7,],
+                       fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][6,],
+                       fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][4,],
+                       fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][2,])
+  
+red_centroid_average <- colMeans(red_centroids)
+
+
+orange_centroids <- rbind(fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][6,],
+                          fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][8,],
+                          fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][6,],
+                          fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][2,],
+                          fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][7,],
+                          fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][3,],
+                          fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][4,],
+                          fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][3,])
+
+orange_centroid_average <- colMeans(orange_centroids)
+
+
+green_centroids <- rbind(fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][4,],
+                         fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][5,],
+                         fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][7,],
+                         fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][6,],
+                         fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][1,],
+                         fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][2,],
+                         fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][2,],
+                         fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][1,],
+                         fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][7,],
+                         fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][8,],
+                         fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][5,])
+
+green_centroid_average <- colMeans(green_centroids)
+
+
+blue_centroids <- rbind(fit_fhmm_8state_80p_ages915_subset_1$centroids$data[[1]][5,],
+                        fit_fhmm_8state_80p_ages915_subset_2$centroids$data[[1]][2,],
+                        fit_fhmm_8state_80p_ages915_subset_3$centroids$data[[1]][6,],
+                        fit_fhmm_8state_80p_ages915_subset_4$centroids$data[[1]][4,],
+                        fit_fhmm_8state_80p_ages915_subset_5$centroids$data[[1]][8,],
+                        fit_fhmm_8state_80p_ages915_subset_6$centroids$data[[1]][5,],
+                        fit_fhmm_8state_80p_ages915_subset_7$centroids$data[[1]][6,],
+                        fit_fhmm_8state_80p_ages915_subset_8$centroids$data[[1]][5,],
+                        fit_fhmm_8state_80p_ages915_subset_9$centroids$data[[1]][1,],
+                        fit_fhmm_8state_80p_ages915_subset_10$centroids$data[[1]][1,])
+
+blue_centroid_average <- colMeans(blue_centroids)
+
+
+
+initial_average_centroids_plot <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5))),y=blue_centroid_average,colour="blue")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5))),y=green_centroid_average,colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5))),y=orange_centroid_average,colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5))),y=red_centroid_average,colour="red")+
+  ylim(0,1) + ggtitle("initialising centroids - average across subsets for ages 9-15")# High delta
+
+initial_average_centroids_plot
+
+
+initial_centroids_915_df <- rbind(red_centroid_average,orange_centroid_average,green_centroid_average,blue_centroid_average)
+
+#save(initial_centroids_915_df,file="initial_centroids_915_df")
+```
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!! Final FHMM model for paper... 23/02/2023
+
+# Ages 9-15 initialised 4-state model
+```{r}
+
+
+load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fooof_ages915_stacked")
+
+load("initial_centroids_915_df")
+
+# save centroids in expected format
+initial_4_centroids_ages915_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(initial_centroids_915_df)))
+
+
+fooof_ages915_for_fhmm <- list(grid=seq(0,1,length.out=58),data=list(as.matrix(fooof_ages915_stacked))) #90540 = 503*180 obs
+
+dim(fooof_ages915_for_fhmm$data[[1]])[1]
+
+n <- 36 # length of each Eyes closed segment
+n_tot <- dim(fooof_ages915_for_fhmm$data[[1]])[1]
+
+bt <- seq(1,n_tot,by=n)
+
+
+#---------
+
+
+
+time_ages915_4state_initialised_start <- Sys.time()
+fhmm_4state_ages915_initialised <-  set_fhmm(fooof_ages915_for_fhmm,nStates = 4,bT=bt,centroids = initial_4_centroids_ages915_for_fhmm)
+
+fit_fhmm_4state_ages915_initialised <- fitBM_fhmm(fhmm_4state_ages915_initialised) # NEEDS MORE THAN 1 OB PER PERSON
+summary(fit_fhmm_4state_ages915_initialised)
+
+estimated_fhmm_states_80p_ages915_subset_1 <- hmmhdd::viterbi(fit_fhmm_4state_ages915_initialised)
+
+#psych::describe(estimated_fhmm_states_8)
+
+time_ages915_4state_initialised_end <- Sys.time()
+
+time_ages915_4state_initialised_run <- time_ages915_4state_initialised_end - time_ages915_4state_initialised_start
+
+save(fit_fhmm_4state_ages915_initialised,file="/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fit_fhmm_4state_ages915_initialised")
+
+# load("/Volumes/Owen_SSD/CMIhbn_data/Analysis_Outputs/fit_fhmm_4state_ages915_initialised")
+
+estimated_fhmm_states_4state_ages915_initialised <- hmmhdd::viterbi(fit_fhmm_4state_ages915_initialised)
+
+#----------
+
+
+
+gg_fhmm_4states_ages915_initialised <- ggplot()+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][1,]),colour="red")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][2,]),colour="green")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][3,]),colour="orange")+
+  geom_line(aes(x=c(seq(1.5,30,by=0.5)),y=fit_fhmm_4state_ages915_initialised$centroids$data[[1]][4,]),colour="blue")+
+  ylim(0,1) + ggtitle("Final centroids from 4-state FHMM, ages 9-15 early adolescents (n = 503)") + theme(axis.title.y=element_blank())# High delta
+
+gg_fhmm_4states_ages915_initialised
+
+initial_average_centroids_plot
+
+hist(fit_fhmm_4state_ages915_initialised)
+
+
+```
+
+
+
+
+
+
+
+
+
