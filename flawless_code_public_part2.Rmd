@@ -20,18 +20,6 @@ Relating FHMM dominants states, (and eventually FPCs within states of interest),
 - Handedness
 
 (Health outcomes)
-- depressive symptoms (MFQ parent report) 
-# Could make sense to check correlation between parent-report and self-report if going with parent-report for everybody...  wait and see how age relationship to states looks
-- anxiety symptoms (SCARED parent report)
-- positive affect (PANAS - self report)
-- negative affect (PANAS - self report)
-
-- cognitive function (NIH scores)
-
-- global functioning? (CGAS clinician rated)
-
------------------
-
 
 ----------------
 STEPS
