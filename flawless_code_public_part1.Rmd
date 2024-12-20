@@ -7,24 +7,34 @@ output: html_document
 
 # Part 1 - Code accompanying paper "Functional analysis within latent states: A novel framework for analysing functional time series data"
 
+# Install packages as needed
+
+```{r}
+# Install packages from CRAN
+install.packages(c("rmatio", "ForeCA", "tidyverse", "fdapace", "reticulate"))
+
+# Install dependencies for hmmhdd
+install.packages(c("gmfd", "roahd"))
+
+# Install hmmhdd from archive
+install.packages("https://cran.r-project.org/src/contrib/Archive/hmmhdd/hmmhdd_1.0.tar.gz", 
+                repos = NULL, 
+                type = "source")
+```
+
 ```{r setup}
 
-
 # Packages
-library(rmatio) # 0.14.0 - for importing .mat tensor/array of matrices (spectrogram output of multitaper analysis)
-library(ForeCA) # for spectral entropy - to be run on cleaned EEG time series per channel
-library(tidyverse) # for magrittr piping, ggplot, etc
-library(fdapace) # for fPCA
+library(rmatio)     # v0.19.0 - for importing .mat tensor/array of matrices (spectrogram output of multitaper analysis)
+library(ForeCA)     # v0.2.7 - for spectral entropy - to be run on cleaned EEG time series per channel
+library(tidyverse)  # v2.0.0 - for data manipulation and visualization
+library(fdapace)    # v0.6.0 - for fPCA
 
+# HMMHDD and dependencies (must be installed from archive)
+# Requires: gmfd (v1.0.1) and roahd (v1.4.3)
+library(hmmhdd)     # v1.0 - for functional HMM analysis
 
-#HMM
-#library(depmixS4)
-
-library(hmmhdd)
-
-
-library(reticulate) # for FOOOF
-
+library(reticulate) # v1.36.1 - for FOOOF integration
 
 ```
 
@@ -33,7 +43,6 @@ library(reticulate) # for FOOOF
 ```{r}
 
 #reticulate::conda_create(envname="FOOOF_env", packages = "fooof==1.0.0")
-
 
 #reticulate::conda_install(envname='FOOOF_env', packages = "matplotlib")
 

@@ -32,11 +32,30 @@ STEPS
 5. generate box plots and histograms for each outcome
 
 
-
+# Install packages as needed
 
 ```{r}
-library(tidyverse)
-library(ggplot2)
+
+# Install packages from CRAN
+install.packages(c("tidyverse", "ggplot2", "brms", "gtsummary", "gt", 
+                  "modelsummary", "ggvenn", "fda", "viridis"))
+```
+
+```{r}
+# Data manipulation and visualization
+library(tidyverse)  # v2.0.0 - for data manipulation and visualization
+library(ggplot2)    # v3.5.1 - for plotting
+
+# Analysis packages
+library(fda)        # v6.2.0 - for functional data analysis
+library(viridis)    # v0.6.5 - for color palettes
+library(ggvenn)     # v0.1.10 - for Venn diagrams
+
+# Reporting and modeling
+library(gtsummary)  # v2.0.4 - for summary tables
+library(gt)         # v0.11.1 - for table formatting
+library(brms)       # v2.22.0 - for Bayesian regression models
+library(modelsummary) # v2.2.0 - for model summaries
 ```
 
 
